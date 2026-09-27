@@ -18,13 +18,26 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "rest_ext_compat.hpp"
+#ifdef REST_EXT_HAS_EXTENSION_LOADER
 #include "duckdb/main/extension/extension_loader.hpp"
+#else
+#include "duckdb/main/extension_util.hpp"
+#endif
 
 namespace duckdb {
 
 // Called once when the extension loads. Teaches DuckDB about the "rest_ext_headers" secret type,
 // so `CREATE SECRET (TYPE rest_ext_headers, ...)` becomes valid syntax.
+//
+// DuckDB >= v1.5.x registers through an ExtensionLoader; DuckDB <= v1.4.x has no such wrapper, so
+// this registers straight against the DatabaseInstance via ExtensionUtil instead (see
+// rest_ext_compat.hpp).
+#ifdef REST_EXT_HAS_EXTENSION_LOADER
 void RegisterRestExtHeadersSecretType(ExtensionLoader &loader);
+#else
+void RegisterRestExtHeadersSecretType(DatabaseInstance &db);
+#endif
 
 // Called at ATTACH time for each endpoint we're about to configure. Looks up whichever registered
 // "rest_ext_headers" secret best matches `url` (if any), and merges its HEADERS map together with

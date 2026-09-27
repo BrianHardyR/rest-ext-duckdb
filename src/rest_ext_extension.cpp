@@ -19,6 +19,7 @@
 
 namespace duckdb {
 
+#ifdef REST_EXT_HAS_EXTENSION_LOADER
 static void LoadInternal(ExtensionLoader &loader) {
 	RegisterRestExtStorageExtension(loader.GetDatabaseInstance());
 	RegisterRestExtHeadersSecretType(loader);
@@ -27,6 +28,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 void RestExtExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);
 }
+#else
+static void LoadInternal(DatabaseInstance &db) {
+	RegisterRestExtStorageExtension(db);
+	RegisterRestExtHeadersSecretType(db);
+}
+
+void RestExtExtension::Load(DuckDB &db) {
+	LoadInternal(*db.instance);
+}
+#endif
 
 std::string RestExtExtension::Name() {
 	return "rest_ext";
@@ -44,7 +55,16 @@ std::string RestExtExtension::Version() const {
 
 extern "C" {
 
+#ifdef REST_EXT_HAS_EXTENSION_LOADER
 DUCKDB_CPP_EXTENSION_ENTRY(rest_ext, loader) {
 	duckdb::LoadInternal(loader);
 }
+#else
+// Pre-ExtensionLoader (DuckDB <= v1.4.x) loadable extensions export a raw `<name>_init` symbol
+// taking a DatabaseInstance directly (see duckdb/src/main/extension/extension_load.cpp's
+// `ext_init_fun_t` / "_init" lookup for ExtensionABIType::CPP).
+DUCKDB_EXTENSION_API void rest_ext_init(duckdb::DatabaseInstance &db) {
+	duckdb::LoadInternal(db);
+}
+#endif
 }

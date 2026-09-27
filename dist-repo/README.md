@@ -5,8 +5,11 @@ serving a prebuilt `rest_ext` binary directly via GitHub's raw file hosting - no
 clone, just point DuckDB at it.
 
 Layout: `<duckdb_version>/<platform>/rest_ext.duckdb_extension.gz`, matching exactly what DuckDB's
-`INSTALL ... FROM <repo>` looks up. Built against DuckDB **v1.5.5** (a real tagged release - this
-matters, see below), `linux_amd64` only; other platforms need their own build.
+`INSTALL ... FROM <repo>` looks up - DuckDB fills in `<duckdb_version>` with its own running
+version and `<platform>` with its own platform string, so `INSTALL` automatically fetches whichever
+binary matches. Currently built for DuckDB **v1.3.2, v1.4.5, and v1.5.5** (real tagged releases -
+this matters, see below), `linux_amd64` only; other versions/platforms need their own build - see
+the "Cross-version compatibility" section of `../README.md`.
 
 ## Usage
 

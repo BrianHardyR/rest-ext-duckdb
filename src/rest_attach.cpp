@@ -25,6 +25,12 @@ namespace duckdb {
 // letter-casing the user typed for each option NAME (unlike CREATE SECRET's options, which DuckDB
 // lowercases for you) - so a plain `options.options.find("format")` would miss `FORMAT`/`Format`.
 // This does the case-insensitive search ourselves, and returns the option's value as plain text.
+//
+// DuckDB >= v1.4.x passes a separate AttachOptions& alongside AttachInfo; DuckDB <= v1.3.x instead
+// keeps the options map directly on AttachInfo itself (see CMakeLists.txt's
+// REST_EXT_HAS_ATTACH_OPTIONS check, and RestAttach's own two signatures below) - these two
+// overloads let every call site below stay identical across both.
+#ifdef REST_EXT_HAS_ATTACH_OPTIONS
 static string FindAttachOptionCI(const AttachOptions &options, const string &key) {
 	for (auto &entry : options.options) {
 		if (StringUtil::CIEquals(entry.first, key)) {
@@ -33,6 +39,16 @@ static string FindAttachOptionCI(const AttachOptions &options, const string &key
 	}
 	return string();
 }
+#else
+static string FindAttachOptionCI(const AttachInfo &info, const string &key) {
+	for (auto &entry : info.options) {
+		if (StringUtil::CIEquals(entry.first, key)) {
+			return entry.second.ToString();
+		}
+	}
+	return string();
+}
+#endif
 
 // Reads a local file's full contents from disk.
 //
@@ -100,21 +116,33 @@ static void ParseRestAttachPath(const string &path, string &url, string &headers
 // extension. It has to return a Catalog (DuckDB will throw an internal error if we return
 // nullptr), which is why even single-endpoint mode - which doesn't really need a "database" in any
 // meaningful sense - still builds a small placeholder one (see rest_attachment_catalog.hpp).
+// DuckDB >= v1.4.x's attach_function_t takes (optional_ptr<StorageExtensionInfo>, ..., AttachInfo&,
+// AttachOptions&); DuckDB <= v1.3.x instead takes (StorageExtensionInfo*, ..., AttachInfo&,
+// AccessMode) - the options map lives on AttachInfo itself there, and access_mode is unused by us
+// either way (see CMakeLists.txt's REST_EXT_HAS_ATTACH_OPTIONS check).
+#ifdef REST_EXT_HAS_ATTACH_OPTIONS
 static unique_ptr<Catalog> RestAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
                                       AttachedDatabase &db, const string &name, AttachInfo &info,
                                       AttachOptions &options) {
+	auto &attach_options = options;
+#else
+static unique_ptr<Catalog> RestAttach(StorageExtensionInfo *storage_info, ClientContext &context,
+                                      AttachedDatabase &db, const string &name, AttachInfo &info,
+                                      AccessMode access_mode) {
+	auto &attach_options = info;
+#endif
 	// FORMAT switches ATTACH into "import from an OpenAPI spec document" mode. See spec_import.hpp
 	// for the full explanation. The spec document itself comes from one of two places:
 	//   - SPEC_URL, an http(s) URL fetched with our own HTTP client - required for a REMOTE spec,
 	//     since (see ReadSpecFile's comment) a URL can never go directly in the ATTACH path.
 	//   - otherwise, the ATTACH path itself, treated as a local file path.
-	auto format_option = FindAttachOptionCI(options, "format");
+	auto format_option = FindAttachOptionCI(attach_options, "format");
 	if (!format_option.empty()) {
 		if (!StringUtil::CIEquals(format_option, "openapi")) {
 			throw BinderException("rest_ext: unrecognized FORMAT \"%s\" (expected 'openapi')", format_option);
 		}
 
-		auto spec_url = FindAttachOptionCI(options, "spec_url");
+		auto spec_url = FindAttachOptionCI(attach_options, "spec_url");
 		string spec_document;
 		string spec_origin; // "scheme://host[:port]" the spec was fetched from, if known - used to
 		                    // resolve a RELATIVE "servers" URL (see ParseOpenApiSpec's header comment)
@@ -126,7 +154,7 @@ static unique_ptr<Catalog> RestAttach(optional_ptr<StorageExtensionInfo> storage
 			spec_document = ReadSpecFile(context, info.path);
 		}
 
-		auto base_url_override = FindAttachOptionCI(options, "base_url");
+		auto base_url_override = FindAttachOptionCI(attach_options, "base_url");
 		auto resources = ParseOpenApiSpec(spec_document, base_url_override, spec_origin);
 
 		// A spec document rarely embeds real credentials - CREATE SECRET (see rest_secrets.hpp)
@@ -200,8 +228,13 @@ static unique_ptr<Catalog> RestAttach(optional_ptr<StorageExtensionInfo> storage
 	return CreateRestAttachmentCatalog(db, name);
 }
 
+#ifdef REST_EXT_HAS_ATTACH_OPTIONS
 static unique_ptr<TransactionManager> RestCreateTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,
                                                                    AttachedDatabase &db, Catalog &catalog) {
+#else
+static unique_ptr<TransactionManager> RestCreateTransactionManager(StorageExtensionInfo *storage_info,
+                                                                   AttachedDatabase &db, Catalog &catalog) {
+#endif
 	// Single-endpoint mode's placeholder Catalog is a DuckCatalog subclass (see
 	// rest_attachment_catalog.hpp), and DuckDB's ready-made DuckTransactionManager only works with
 	// a DuckCatalog - it has an internal check that refuses anything else. Namespace mode's
@@ -225,7 +258,14 @@ struct RestExtStorageExtension : public StorageExtension {
 
 void RegisterRestExtStorageExtension(DatabaseInstance &db) {
 	auto &config = DBConfig::GetConfig(db);
+#ifdef REST_EXT_HAS_STORAGE_EXTENSION_REGISTER
+	// DuckDB >= v1.5.x: DBConfig::storage_extensions is private; this is the only way in.
 	StorageExtension::Register(config, "rest_ext", make_shared_ptr<RestExtStorageExtension>());
+#else
+	// DuckDB <= v1.4.x: no Register helper exists yet - storage_extensions is instead a plain
+	// public map of unique_ptr (see CMakeLists.txt's REST_EXT_HAS_STORAGE_EXTENSION_REGISTER check).
+	config.storage_extensions["rest_ext"] = make_uniq<RestExtStorageExtension>();
+#endif
 }
 
 } // namespace duckdb

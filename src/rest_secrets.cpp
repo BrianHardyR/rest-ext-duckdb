@@ -26,6 +26,7 @@ static unique_ptr<BaseSecret> CreateRestExtHeadersSecretFromConfig(ClientContext
 	return std::move(secret);
 }
 
+#ifdef REST_EXT_HAS_EXTENSION_LOADER
 void RegisterRestExtHeadersSecretType(ExtensionLoader &loader) {
 	// Step 1: register the TYPE itself (the name "rest_ext_headers" that CREATE SECRET's TYPE
 	// clause refers to).
@@ -49,6 +50,24 @@ void RegisterRestExtHeadersSecretType(ExtensionLoader &loader) {
 	secret_function.named_parameters["headers"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 	loader.RegisterFunction(secret_function);
 }
+#else
+void RegisterRestExtHeadersSecretType(DatabaseInstance &db) {
+	// Same two steps as the ExtensionLoader path above, just via the older, free-function
+	// ExtensionUtil API that DuckDB <= v1.4.x still uses.
+	SecretType secret_type;
+	secret_type.name = "rest_ext_headers";
+	secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
+	secret_type.default_provider = "config";
+	ExtensionUtil::RegisterSecretType(db, secret_type);
+
+	CreateSecretFunction secret_function;
+	secret_function.secret_type = "rest_ext_headers";
+	secret_function.provider = "config";
+	secret_function.function = CreateRestExtHeadersSecretFromConfig;
+	secret_function.named_parameters["headers"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+	ExtensionUtil::RegisterFunction(db, secret_function);
+}
+#endif
 
 string ResolveHeaders(ClientContext &context, const string &url, const string &inline_headers_json) {
 	case_insensitive_map_t<string> merged;

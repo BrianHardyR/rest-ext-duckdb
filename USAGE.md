@@ -54,8 +54,11 @@ A couple of things worth knowing:
 - This binary isn't signed with DuckDB's official key, so it also needs either `duckdb -unsigned`,
   or `allow_unsigned_extensions=true` passed at connection time (it can't be changed with `SET`
   after the database is already open).
-- Only `linux_amd64` has a prebuilt binary here (this project's build platform) - macOS/Windows/arm64
-  need the build-from-source path below.
+- Prebuilt `linux_amd64` binaries are published for DuckDB v1.3.2, v1.4.5, and v1.5.5 - `INSTALL`
+  automatically fetches whichever one matches your running DuckDB's exact version (that's how
+  `custom_extension_repository` resolution works: DuckDB appends its own version and platform to
+  the repository URL). A DuckDB version outside that range, or a non-Linux/non-x86_64 platform,
+  needs the build-from-source path below.
 
 Otherwise, build from source:
 

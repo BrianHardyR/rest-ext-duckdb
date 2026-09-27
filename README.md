@@ -6,7 +6,7 @@ automatically.
 
 ## Install
 
-Prebuilt binary (Linux x86_64 only, no build required):
+Prebuilt binary (Linux x86_64, DuckDB v1.3.2/v1.4.5/v1.5.5 - no build required):
 
 ```sql
 INSTALL httpfs;
@@ -16,10 +16,11 @@ INSTALL rest_ext;
 LOAD rest_ext;
 ```
 
-The binary is unsigned, so DuckDB also needs to be started with `duckdb -unsigned` (or
+`INSTALL` automatically fetches the binary matching your running DuckDB's exact version. The
+binary is unsigned, so DuckDB also needs to be started with `duckdb -unsigned` (or
 `allow_unsigned_extensions=true` at connection time).
 
-Other platforms - build from source:
+Other platforms, or a DuckDB version outside that range - build from source:
 
 ```sh
 git clone --recurse-submodules https://github.com/BrianHardyR/rest-ext-duckdb.git
@@ -90,3 +91,18 @@ tooling). Update with:
 ```sh
 git submodule update --init --recursive
 ```
+
+### Cross-version compatibility
+
+The source targets a range of DuckDB core versions (currently v1.3.2 through v1.5.5) from one
+codebase, not just the pinned submodule version - DuckDB's own extension C++ API isn't ABI-stable
+across releases, so a handful of call sites (`StorageExtension` registration, the extension entry
+point, and the `ATTACH` callback's options parameter) are guarded by compile-time detection instead
+of hardcoded to one version's API - see the comments in `CMakeLists.txt` and
+`src/include/rest_ext_compat.hpp`. `dist-repo/` holds one prebuilt binary per supported version,
+built by checking out `duckdb`/`extension-ci-tools` to each target tag in turn and rebuilding -
+there's no single binary that works everywhere (DuckDB's storage-extension/`ATTACH`/secret-type
+APIs aren't exposed through DuckDB's stable C API at all yet, only the classic internal C++ one).
+Adding support for a new DuckDB release means bumping the submodules to that tag, fixing whatever
+new API break turns up the same way, rebuilding, and dropping the binary into
+`dist-repo/v<version>/linux_amd64/`.
