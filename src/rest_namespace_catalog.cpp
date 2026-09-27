@@ -21,7 +21,7 @@ namespace duckdb {
 // of repeating similar text 11 times. `[[noreturn]]` just tells the compiler this function always
 // throws and never returns normally, which quiets down "missing return statement" warnings at
 // every call site.
-[[noreturn]] static void ThrowNamespaceUnsupported(const Identifier &schema_name, const string &operation) {
+[[noreturn]] static void ThrowNamespaceUnsupported(const string &schema_name, const string &operation) {
 	throw NotImplementedException("rest_ext namespace \"%s\" is a fixed, read-only view of configured REST "
 	                              "resources; %s is not supported",
 	                              schema_name, operation);
@@ -57,7 +57,7 @@ public:
 
 			// Build a TableFunction named after this resource (e.g. "Projects"), wired up to the
 			// SAME bind/execute callbacks every other REST call in this extension uses.
-			TableFunction fn(Identifier(resource.name), {LogicalType::VARCHAR, LogicalType::VARCHAR},
+			TableFunction fn(resource.name, {LogicalType::VARCHAR, LogicalType::VARCHAR},
 			                 RestFetchFunction, RestFetchBind, RestFetchInitGlobal);
 			fn.function_info = fetch_info;
 
@@ -160,7 +160,7 @@ public:
 	// everyone else does.)
 	void Initialize(bool load_builtin) override {
 		CreateSchemaInfo info;
-		info.SetQualifiedName(QualifiedName({Identifier("main")}, Identifier()));
+		info.schema = "main";
 		schema = make_uniq<RestNamespaceSchemaEntry>(*this, info, resources);
 	}
 
@@ -225,8 +225,8 @@ public:
 	// "if someone qualifies a name with just my catalog name and no schema (like `gcp.Projects`
 	// rather than `gcp.main.Projects`), assume they mean the schema called main". Without this,
 	// DuckDB would have no way to guess which schema to look in.
-	optional<Identifier> GetDefaultSchema() const override {
-		return Identifier("main");
+	string GetDefaultSchema() const override {
+		return "main";
 	}
 
 private:

@@ -36,7 +36,7 @@ public:
 		// works), and DuckDB normally protects internal/built-in entries from being dropped by
 		// accident - allow_drop_internal says "yes, I really do mean to drop this one".
 		drop_info.allow_drop_internal = true;
-		drop_info.SetQualifiedName(QualifiedName(Identifier(function_name)));
+		drop_info.name = function_name;
 		Catalog::GetSystemCatalog(context).DropEntry(context, drop_info);
 	}
 

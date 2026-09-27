@@ -46,7 +46,7 @@ struct RestFetchInfo : public TableFunctionInfo {
 // The BIND callback: makes the real HTTP request, parses the JSON response, and works out the
 // output schema (return_types/names) from its shape.
 unique_ptr<FunctionData> RestFetchBind(ClientContext &context, TableFunctionBindInput &input,
-                                       vector<LogicalType> &return_types, vector<Identifier> &names);
+                                       vector<LogicalType> &return_types, vector<string> &names);
 
 // The "set up per-query state" callback, called once per query right before EXECUTE starts. We
 // don't need much state (just a row counter), but DuckDB's TableFunction always wants one of

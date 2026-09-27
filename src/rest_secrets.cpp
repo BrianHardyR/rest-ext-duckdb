@@ -61,7 +61,7 @@ string ResolveHeaders(ClientContext &context, const string &url, const string &i
 	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
 	auto match = secret_manager.LookupSecret(transaction, url, "rest_ext_headers");
 	if (match.HasMatch()) {
-		auto &kv_secret = match.GetSecret().Cast<KeyValueSecret>();
+		auto &kv_secret = dynamic_cast<const KeyValueSecret &>(match.GetSecret());
 		Value headers_value;
 		if (kv_secret.TryGetValue("headers", headers_value)) {
 			// A MAP value's internal representation is a list of {key, value} structs - this is

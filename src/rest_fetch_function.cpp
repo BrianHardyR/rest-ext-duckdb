@@ -67,7 +67,7 @@ struct RestFetchBindData : public FunctionData {
 };
 
 unique_ptr<FunctionData> RestFetchBind(ClientContext &context, TableFunctionBindInput &input,
-                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
+                                       vector<LogicalType> &return_types, vector<string> &names) {
 	// `input.info` is how the per-resource config (url/headers/method) that ATTACH set up reaches
 	// us here. It has to travel this way rather than as a captured lambda variable, because
 	// table_function_bind_t (the type of this very function) is a plain C function pointer under
@@ -129,7 +129,7 @@ unique_ptr<FunctionData> RestFetchBind(ClientContext &context, TableFunctionBind
 		// The rows aren't objects (e.g. a bare array of numbers) - there are no natural field
 		// names to use as columns, so wrap the whole thing as one column called "value".
 		result->wrap_scalar = true;
-		result->row_type = LogicalType::STRUCT({{Identifier("value"), inferred}});
+		result->row_type = LogicalType::STRUCT({{"value", inferred}});
 	}
 
 	// Tell DuckDB what the output columns and types are - this is the entire point of bind.

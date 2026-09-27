@@ -97,10 +97,10 @@ LogicalType MergeJsonTypes(const LogicalType &a, const LogicalType &b) {
 		auto merged = StructType::GetChildTypes(a);
 		unordered_map<string, idx_t> index_by_name;
 		for (idx_t i = 0; i < merged.size(); i++) {
-			index_by_name[merged[i].first.GetIdentifierName()] = i;
+			index_by_name[merged[i].first] = i;
 		}
 		for (auto &b_child : StructType::GetChildTypes(b)) {
-			auto b_name = b_child.first.GetIdentifierName();
+			auto &b_name = b_child.first;
 			auto it = index_by_name.find(b_name);
 			if (it == index_by_name.end()) {
 				index_by_name[b_name] = merged.size();
@@ -161,12 +161,12 @@ LogicalType InferJsonType(yyjson_val *val) {
 		yyjson_obj_iter iter = yyjson_obj_iter_with(val);
 		while ((key = yyjson_obj_iter_next(&iter))) {
 			v = yyjson_obj_iter_get_val(key);
-			children.emplace_back(Identifier(string(yyjson_get_str(key), yyjson_get_len(key))), InferJsonType(v));
+			children.emplace_back(string(yyjson_get_str(key), yyjson_get_len(key)), InferJsonType(v));
 		}
 		if (children.empty()) {
 			// An empty JSON object ({}) has no keys to build a STRUCT from - give it one
 			// placeholder field so it's still a valid (if useless) STRUCT type.
-			children.emplace_back(Identifier("value"), LogicalType::VARCHAR);
+			children.emplace_back("value", LogicalType::VARCHAR);
 		}
 		return LogicalType::STRUCT(std::move(children));
 	}
@@ -225,7 +225,7 @@ Value JsonToValue(yyjson_val *val, const LogicalType &type) {
 		// key some rows have and others don't) just becomes NULL.
 		child_list_t<Value> struct_values;
 		for (auto &child : StructType::GetChildTypes(type)) {
-			auto child_name = child.first.GetIdentifierName();
+			auto &child_name = child.first;
 			yyjson_val *child_val =
 			    yyjson_is_obj(val) ? yyjson_obj_getn(val, child_name.c_str(), child_name.size()) : nullptr;
 			struct_values.emplace_back(child.first, JsonToValue(child_val, child.second));

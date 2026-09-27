@@ -3,7 +3,7 @@
 #include "json_helpers.hpp"
 
 #include "duckdb/common/case_insensitive_map.hpp"
-#include "duckdb/main/http/http_util.hpp"
+#include "duckdb/common/http_util.hpp"
 
 // This file builds its own OpenSSL-enabled instantiation of the vendored, header-only httplib
 // library (it lives at duckdb/third_party/httplib, bundled with DuckDB itself - not something we

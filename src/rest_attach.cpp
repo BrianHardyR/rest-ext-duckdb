@@ -11,7 +11,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/main/config.hpp"
-#include "duckdb/main/http/http_util.hpp"
+#include "duckdb/common/http_util.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/storage/storage_extension.hpp"
@@ -189,7 +189,7 @@ static unique_ptr<Catalog> RestAttach(optional_ptr<StorageExtensionInfo> storage
 	// `SELECT * FROM myapi(...)` resolves to it directly - see rest_attachment_catalog.hpp's
 	// header comment for why this has to be registered in the shared system catalog rather than
 	// in some catalog of our own.
-	TableFunction call_function(Identifier(name), {LogicalType::VARCHAR, LogicalType::VARCHAR}, RestFetchFunction,
+	TableFunction call_function(name, {LogicalType::VARCHAR, LogicalType::VARCHAR}, RestFetchFunction,
 	                            RestFetchBind, RestFetchInitGlobal);
 	call_function.function_info = fetch_info;
 
