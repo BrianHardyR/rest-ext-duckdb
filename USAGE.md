@@ -7,17 +7,27 @@ schema inferred from the JSON response - nested objects become `STRUCT` columns,
 
 ## Quick start
 
-Don't want to build it yourself? Install the prebuilt Linux x86_64 binary straight from this repo:
+Don't want to build it yourself? Install the prebuilt Linux x86_64 binary without compiling
+anything - just a lightweight clone to get the binary onto disk, then point DuckDB at it locally:
+
+```sh
+git clone https://github.com/BrianHardyR/rest-ext-duckdb.git
+```
 
 ```sql
-SET custom_extension_repository='https://raw.githubusercontent.com/BrianHardyR/rest-ext-duckdb/main/dist-repo';
-SET allow_unsigned_extensions=true;
+-- -unsigned is required (this binary isn't signed with DuckDB's official key) - either start
+-- the CLI as `duckdb -unsigned`, or pass allow_unsigned_extensions=true at connection time
+-- (it can't be changed with SET after the database is already open).
+SET custom_extension_repository='/path/to/rest-ext-duckdb/dist-repo';
 INSTALL rest_ext;
 LOAD rest_ext;
 ```
 
-(This binary isn't signed with DuckDB's official key, hence `allow_unsigned_extensions`. Other
-platforms - macOS, Windows, arm64 - aren't built yet; build from source below for those.)
+(A plain `https://raw.githubusercontent.com/...` URL here would need `httpfs` loaded first, and
+`httpfs` doesn't have a published binary for this project's exact pinned DuckDB dev commit -
+that's a limitation of pointing at an unreleased commit, not of `rest_ext` itself. A local path
+sidesteps it entirely, and is otherwise identical. Other platforms - macOS, Windows, arm64 -
+aren't built yet; build from source below for those.)
 
 Otherwise, build from source:
 
