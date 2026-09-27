@@ -1,0 +1,290 @@
+# name: test/sql/rest_ext.test
+# description: exercise the rest_ext ATTACH-based REST table function contract
+# test requirements call for adoption of the postgres extention's attach method <DO NOT REMOVE>
+# i.e :
+# INSTALL <extention name>
+# LOAD <extension name>
+# ATTACH '<configuration i.e. url=http://endpoint headers=keys-values method=GET/POST..> as <custom_name i.e weatherapi> (Type rest_ext)
+# SELECT * FROM custom_name(query_params key values, optional body object)
+
+# Require statement will ensure this test is run with this extension loaded
+require rest_ext
+
+# ATTACH ... (TYPE rest_ext) registers a bare, unqualified <alias>(query_params, body) table
+# function by default - not a dot-qualified <alias>.something(...) - since unqualified
+# table-function name resolution never consults attached-database names, only ordinary schema
+# search paths. Passing resources={...} instead switches to namespace mode (see further down),
+# which DOES give dot-qualified <alias>.<ResourceName>(...) access, backed by a real per-attachment
+# Catalog+Schema - that's the only shape that needs one.
+
+# ATTACH requires a url=... component in the path
+statement error
+ATTACH 'method=GET' AS badcfg (TYPE rest_ext);
+----
+rest_ext ATTACH requires a url=
+
+# <alias>(query_params, body) issues a real HTTP request, then infers its OUTPUT SCHEMA from the
+# JSON response shape at bind time (rather than always returning one raw-JSON-text column), so
+# these tests require outbound internet access and exercise real third-party APIs.
+
+# A single JSON object response becomes one row, with its top-level keys as columns; nested
+# objects/arrays become native STRUCT/LIST columns rather than being flattened. Same endpoint the
+# weather-duckdb Go prototype elsewhere in this workspace uses - generationtime_ms is the only
+# field that varies per call, so it's deliberately not asserted on.
+statement ok
+ATTACH 'url=https://archive-api.open-meteo.com/v1/era5 headers={"Accept":"application/json"} method=GET' AS weatherapi (TYPE rest_ext);
+
+query TTTR
+SELECT typeof(latitude), typeof(timezone), typeof(hourly), timezone
+FROM weatherapi('{"latitude":"52.52","longitude":"13.41","start_date":"2021-01-01","end_date":"2021-01-01","hourly":"temperature_2m"}', '{}');
+----
+DOUBLE	VARCHAR	STRUCT("time" VARCHAR[], temperature_2m DOUBLE[])	GMT
+
+query R
+SELECT hourly.temperature_2m[1]
+FROM weatherapi('{"latitude":"52.52","longitude":"13.41","start_date":"2021-01-01","end_date":"2021-01-01","hourly":"temperature_2m"}', '{}');
+----
+0.5
+
+# A JSON array of objects becomes one row per element, columns = union of each element's keys,
+# with nested objects again preserved as STRUCT rather than flattened. jsonplaceholder.typicode.com
+# is a long-stable public test fixture: exactly 10 users, id 1 is always "Leanne Graham".
+statement ok
+ATTACH 'url=https://jsonplaceholder.typicode.com/users method=GET' AS users_api (TYPE rest_ext);
+
+query II
+SELECT count(*), min(id) FROM users_api('{}', '{}');
+----
+10	1
+
+query II
+SELECT name, address.city FROM users_api('{}', '{}') WHERE id = 1;
+----
+Leanne Graham	Gwenborough
+
+# A non-JSON response (e.g. plain HTML) falls back to the pre-dynamic-schema single raw-text
+# "result" column rather than erroring.
+statement ok
+ATTACH 'url=https://example.com/ method=GET' AS htmlpage (TYPE rest_ext);
+
+query I
+SELECT result LIKE '%<html%' FROM htmlpage('{}', '{}');
+----
+true
+
+# POST threads headers, query params, and a JSON body all at once, without any duplicated/clobbered
+# Content-Type header (a real bug caught by testing against a live echo endpoint: httplib's
+# Post(path, headers, body, content_type) does not dedupe a Content-Type already present in
+# headers) - now checked via structured column access rather than substring matching on raw text.
+statement ok
+ATTACH 'url=https://postman-echo.com/post headers={"Content-Type":"application/json"} method=POST' AS svc_post (TYPE rest_ext);
+
+query II
+SELECT data.hello, headers['content-type']
+FROM svc_post('{}', '{"hello":"world"}');
+----
+world	application/json
+
+statement ok
+DETACH svc_post;
+
+# DETACH must remove the registered <alias>(...) function (Catalog::OnDetach hook) - otherwise it
+# would linger as a dangling global callable, and re-ATTACHing the same alias would hit a
+# "function already exists" catalog conflict instead of cleanly replacing it.
+statement ok
+DETACH users_api;
+
+statement error
+SELECT * FROM users_api('{}', '{}');
+----
+Catalog Error
+
+statement ok
+ATTACH 'url=https://jsonplaceholder.typicode.com/users method=GET' AS users_api (TYPE rest_ext);
+
+query I
+SELECT count(*) FROM users_api('{}', '{}');
+----
+10
+
+# The untouched first attachment still works after another was detached and re-attached
+query I
+SELECT timezone
+FROM weatherapi('{"latitude":"52.52","longitude":"13.41","start_date":"2021-01-01","end_date":"2021-01-01","hourly":"temperature_2m"}', '{}');
+----
+GMT
+
+# Namespace mode: resources={...} gives dot-qualified <alias>.<ResourceName>(...) access, each
+# resource independently configured (own full URL), backed by a real Catalog+SchemaCatalogEntry
+# (RestNamespaceCatalog/RestNamespaceSchemaEntry) rather than the system-catalog trick above.
+statement ok
+ATTACH 'resources={"Users":"https://jsonplaceholder.typicode.com/users","Weather":"https://archive-api.open-meteo.com/v1/era5"} headers={"Accept":"application/json"} method=GET' AS testns (TYPE rest_ext);
+
+query II
+SELECT count(*), min(id) FROM testns.Users('{}', '{}');
+----
+10	1
+
+query I
+SELECT timezone
+FROM testns.Weather('{"latitude":"52.52","longitude":"13.41","start_date":"2021-01-01","end_date":"2021-01-01","hourly":"temperature_2m"}', '{}');
+----
+GMT
+
+# DETACH cleans up automatically here (unlike the system-catalog trick above): a namespace's
+# resources live entirely inside its own Schema/AttachedDatabase, so no OnDetach override is
+# needed - re-ATTACHing with a different resource set just works.
+statement ok
+DETACH testns;
+
+statement ok
+ATTACH 'resources={"Users":"https://jsonplaceholder.typicode.com/users","Posts":"https://jsonplaceholder.typicode.com/posts"}' AS testns (TYPE rest_ext);
+
+query II
+SELECT (SELECT count(*) FROM testns.Users('{}', '{}')), (SELECT count(*) FROM testns.Posts('{}', '{}'));
+----
+10	100
+
+statement ok
+DETACH testns;
+
+# Headers/credentials can come from a CREATE SECRET instead of being embedded in plaintext in the
+# ATTACH path string - a generic header bag (not tied to any particular auth scheme), matched to
+# the target URL by longest SCOPE-prefix, the same mechanism httpfs/S3 secrets use.
+statement ok
+CREATE SECRET rest_ext_test_secret (
+    TYPE rest_ext_headers,
+    HEADERS MAP {'X-From-Secret': 'secret-value', 'X-Override-Me': 'from-secret'},
+    SCOPE 'https://postman-echo.com'
+);
+
+# The secret is registered under our type and its header values are redacted, not shown in
+# cleartext, in duckdb_secrets() - a header bag is exactly where bearer tokens/API keys live.
+query II
+SELECT type, secret_string LIKE '%headers=redacted%' FROM duckdb_secrets() WHERE name = 'rest_ext_test_secret';
+----
+rest_ext_headers	true
+
+# The secret's header actually reaches the outgoing request (checked via a live echo endpoint),
+# and an inline ATTACH header for the same key wins over the secret's value for that key, while a
+# non-conflicting secret header still comes through.
+statement ok
+ATTACH 'url=https://postman-echo.com/get headers={"X-Override-Me":"from-inline"} method=GET' AS secretapi (TYPE rest_ext);
+
+query II
+SELECT headers['x-override-me'], headers['x-from-secret']
+FROM secretapi('{}', '{}');
+----
+from-inline	secret-value
+
+statement ok
+DETACH secretapi;
+
+# Namespace-mode resources resolve secrets independently per resource URL, since a namespace's
+# resources can span different hosts (e.g. GCP's various services) with different matching
+# secrets - a second secret scoped to a different host must not leak into the first resource.
+statement ok
+CREATE SECRET rest_ext_test_secret_b (
+    TYPE rest_ext_headers,
+    HEADERS MAP {'X-Tag': 'from-b'},
+    SCOPE 'https://jsonplaceholder.typicode.com'
+);
+
+statement ok
+ATTACH 'resources={"EchoA":"https://postman-echo.com/get","UsersB":"https://jsonplaceholder.typicode.com/users"}' AS multi_secret_ns (TYPE rest_ext);
+
+query I
+SELECT headers['x-from-secret'] FROM multi_secret_ns.EchoA('{}', '{}');
+----
+secret-value
+
+statement ok
+DETACH multi_secret_ns;
+
+statement ok
+DROP SECRET rest_ext_test_secret;
+
+statement ok
+DROP SECRET rest_ext_test_secret_b;
+
+# Spec-import mode: FORMAT switches ATTACH into "load resources from an OpenAPI spec document"
+# (instead of a hand-written resources={...} mapping or url=... single endpoint). The ATTACH path
+# becomes a file path (or http(s) URL) to load the spec from. A small local OpenAPI spec lives in
+# test/fixtures/, pointing its operations at jsonplaceholder.typicode.com (the same long-stable
+# public fixture used elsewhere above). OpenAPI is the only supported spec format - other formats
+# (e.g. a Postman collection) are expected to be converted to OpenAPI first, using any of the
+# widely available third-party converters, rather than this extension understanding several
+# formats partially.
+
+# operationId becomes the resource name (listUsers/listPosts/getUser), and the spec's own
+# "servers" entry becomes the base URL every path is appended to.
+statement ok
+ATTACH 'test/fixtures/openapi_sample.json' AS petapi (TYPE rest_ext, FORMAT 'openapi');
+
+query II
+SELECT (SELECT count(*) FROM petapi.listUsers('{}', '{}')), (SELECT count(*) FROM petapi.listPosts('{}', '{}'));
+----
+10	100
+
+# A path with a {parameter} placeholder (here "/users/{id}") gets it filled in from the matching
+# key in query_params at call time, rather than that key being sent as a "?id=..." query string
+# parameter - proven by getting back a single user object (id=1 is always "Leanne Graham" in this
+# fixture), not the full 10-user list GET /users would give.
+query I
+SELECT name FROM petapi.getUser('{"id":"1"}', '{}');
+----
+Leanne Graham
+
+# Omitting a required path parameter is a clear, immediate error naming exactly which placeholder
+# is missing, rather than silently sending a broken literal "{id}" in the URL.
+statement error
+SELECT * FROM petapi.getUser('{}', '{}');
+----
+requires a value for "{id}"
+
+statement ok
+DETACH petapi;
+
+# An OpenAPI 3.x server URL can itself contain {variable} placeholders with declared defaults
+# (e.g. servers: [{"url": "https://{host}", "variables": {"host": {"default": "..."}}}]) - these
+# are resolved once, from each variable's own default, when the base URL is determined.
+statement ok
+ATTACH 'test/fixtures/openapi_server_vars.json' AS svapi (TYPE rest_ext, FORMAT 'openapi');
+
+query I
+SELECT count(*) FROM svapi.listUsers('{}', '{}');
+----
+10
+
+statement ok
+DETACH svapi;
+
+# An unrecognized FORMAT value is a clear, immediate error rather than a confusing failure later -
+# including a value like 'postman' that used to be valid before Postman support was dropped in
+# favor of investing solely in OpenAPI (the standard other tools already convert Postman
+# collections to).
+statement error
+ATTACH 'test/fixtures/openapi_sample.json' AS badformat (TYPE rest_ext, FORMAT 'postman');
+----
+unrecognized FORMAT
+
+# A document that's valid JSON but doesn't have an "openapi"/"swagger" version key also fails
+# clearly, rather than silently producing zero resources.
+statement error
+ATTACH 'test/fixtures/not_a_spec.json' AS badspec (TYPE rest_ext, FORMAT 'openapi');
+----
+expected an OpenAPI document
+
+# BASE_URL overrides whatever base URL the OpenAPI spec itself declares (its "servers" entry) -
+# confirmed here by an overridden host showing up in the resulting request's own error message,
+# since postman-echo.com has no "/users" endpoint for this to actually succeed against.
+statement ok
+ATTACH 'test/fixtures/openapi_sample.json' AS overriddenapi (TYPE rest_ext, FORMAT 'openapi', BASE_URL 'https://postman-echo.com');
+
+statement error
+SELECT * FROM overriddenapi.listUsers('{}', '{}');
+----
+https://postman-echo.com/users
+
+statement ok
+DETACH overriddenapi;

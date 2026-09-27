@@ -1,0 +1,17 @@
+{
+  "openapi": "3.0.0",
+  "info": { "title": "Server Variable Test API", "version": "1.0.0" },
+  "servers": [
+    {
+      "url": "https://{host}",
+      "variables": {
+        "host": { "default": "jsonplaceholder.typicode.com" }
+      }
+    }
+  ],
+  "paths": {
+    "/users": {
+      "get": { "operationId": "listUsers" }
+    }
+  }
+}

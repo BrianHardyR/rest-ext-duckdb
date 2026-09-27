@@ -1,0 +1,3 @@
+{
+  "hello": "this is valid JSON, but neither an OpenAPI spec nor a Postman collection"
+}

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.5)
 
 # Set extension name here
-set(TARGET_NAME waddle)
+set(TARGET_NAME rest_ext)
 
 # DuckDB's extension distribution supports vcpkg. As such, dependencies can be added in ./vcpkg.json and then
 # used in cmake with find_package. Feel free to remove or replace with other dependencies.
@@ -18,7 +18,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
 
-set(EXTENSION_SOURCES src/waddle_extension.cpp)
+set(EXTENSION_SOURCES
+    src/rest_ext_extension.cpp
+    src/rest_attach.cpp
+    src/rest_attachment_catalog.cpp
+    src/rest_namespace_catalog.cpp
+    src/rest_fetch_function.cpp
+    src/rest_secrets.cpp
+    src/spec_import.cpp
+    src/http_client.cpp
+    src/json_helpers.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

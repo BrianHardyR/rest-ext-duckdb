@@ -1,0 +1,92 @@
+# name: test/sql/rest_ext_openapi_live.test_slow
+# description: validate OpenAPI spec-import against real, live, publicly hosted Petstore demo APIs
+# group: [rest_ext]
+
+# Everything else in test/sql/rest_ext.test runs against either our own local fixtures or
+# long-stable public test data (jsonplaceholder.typicode.com). This file instead hits the two
+# official Swagger "Petstore" demo services directly over the network, fetching each one's REAL
+# OpenAPI spec via SPEC_URL rather than a checked-in fixture - it's the only place that exercises
+# a spec none of our own tests wrote. Because it depends on outbound internet access, a
+# third-party demo service's uptime, and (for the exact pet IDs looked up below) that service's
+# own mutable, shared, not-append-only demo data, it's a .test_slow file: excluded from the
+# default `make test` run, and only run on demand.
+
+require rest_ext
+
+# --- OpenAPI 3.x: the official Swagger Petstore v3 demo ---
+#
+# This spec's own "servers" entry is a RELATIVE URL ("/api/v3", not a full https://...) - a real,
+# standard OpenAPI pattern (see spec_import.hpp's header comment), resolved here against the
+# origin the spec was itself fetched from via SPEC_URL (https://petstore3.swagger.io). A plain
+# ATTACH 'https://...' AS x (TYPE rest_ext, FORMAT 'openapi') would instead hit DuckDB core's own
+# unconditional "remote ATTACH path requires httpfs" check (see rest_attach.cpp's ReadSpecFile
+# comment) - SPEC_URL is what routes around that.
+statement ok
+ATTACH 'petstore_v3' AS petstore_v3 (TYPE rest_ext, FORMAT 'openapi', SPEC_URL 'https://petstore3.swagger.io/api/v3/openapi.json');
+
+# findPetsByStatus exercises query-parameter passing against a real, live, mutable dataset - only
+# the shape of the result and that at least one row comes back are checked, never a specific row
+# count (which changes over time as other people/tests use this shared public demo).
+query TTT
+SELECT typeof(id), typeof(name), typeof(status)
+FROM petstore_v3.findPetsByStatus('{"status":"available"}', '{}') LIMIT 1;
+----
+BIGINT	VARCHAR	VARCHAR
+
+query I
+SELECT count(*) > 0 FROM petstore_v3.findPetsByStatus('{"status":"available"}', '{}');
+----
+true
+
+# getPetById exercises "/pet/{petId}" path-parameter substitution. Rather than hardcoding a
+# specific pet ID (this live demo's data changes over time, so a fixed ID could easily 404 on a
+# future run - see the "getPetById 404" note in this project's history), a real, currently-existing
+# ID is looked up first via findPetsByStatus and stashed in a variable, then fed back into
+# getPetById - proving path-parameter substitution round-trips correctly against a real host,
+# without this test ever needing to know or hardcode what that ID actually is.
+statement ok
+SET VARIABLE petstore_v3_pet_id = (SELECT id FROM petstore_v3.findPetsByStatus('{"status":"available"}', '{}') LIMIT 1);
+
+query I
+SELECT id = getvariable('petstore_v3_pet_id')
+FROM petstore_v3.getPetById('{"petId":"' || getvariable('petstore_v3_pet_id')::VARCHAR || '"}', '{}');
+----
+true
+
+statement ok
+DETACH petstore_v3;
+
+# --- Swagger 2.0 (legacy): the older Petstore demo ---
+#
+# Unlike the v3 spec above, a Swagger 2.0 document has no "servers" array at all - the base URL
+# instead comes from three separate top-level fields: "host" (petstore.swagger.io), "basePath"
+# (/v2), and "schemes" (["https", "http"], first entry wins). This is the one code path
+# (DetermineOpenApiBaseUrl's host+basePath+schemes fallback in spec_import.cpp) that, before this
+# file, had only ever been exercised against our own hand-written fixtures - never a real spec.
+statement ok
+ATTACH 'petstore_v2' AS petstore_v2 (TYPE rest_ext, FORMAT 'openapi', SPEC_URL 'https://petstore.swagger.io/v2/swagger.json');
+
+query TTT
+SELECT typeof(id), typeof(name), typeof(status)
+FROM petstore_v2.findPetsByStatus('{"status":"available"}', '{}') LIMIT 1;
+----
+BIGINT	VARCHAR	VARCHAR
+
+query I
+SELECT count(*) > 0 FROM petstore_v2.findPetsByStatus('{"status":"available"}', '{}');
+----
+true
+
+# Same dynamic-ID round-trip as the v3 block above, now against the host+basePath+schemes-derived
+# base URL instead of a "servers" one.
+statement ok
+SET VARIABLE petstore_v2_pet_id = (SELECT id FROM petstore_v2.findPetsByStatus('{"status":"available"}', '{}') LIMIT 1);
+
+query I
+SELECT id = getvariable('petstore_v2_pet_id')
+FROM petstore_v2.getPetById('{"petId":"' || getvariable('petstore_v2_pet_id')::VARCHAR || '"}', '{}');
+----
+true
+
+statement ok
+DETACH petstore_v2;

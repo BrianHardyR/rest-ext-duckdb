@@ -1,0 +1,654 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [6 0 R 8 0 R 10 0 R 12 0 R 14 0 R] /Count 5 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R >> >> /Contents 7 0 R >>
+endobj
+7 0 obj
+<< /Length 4181 >>
+stream
+q
+0.950 0.955 0.965 rg
+44.00 234.15 524.00 64.85 re f
+0.110 0.320 0.550 rg
+44.00 234.15 3.00 64.85 re f
+/F2 20.00 Tf
+0.070 0.220 0.380 rg
+1 0 0 1 54.00 736.00 Tm
+(rest_ext: A Generic REST API Extension for DuckDB) Tj
+0.070 0.220 0.380 rg
+54.00 708.00 504.00 1.60 re f
+/F2 13.50 Tf
+0.110 0.320 0.550 rg
+1 0 0 1 54.00 677.00 Tm
+(Executive Summary) Tj
+0.110 0.320 0.550 rg
+54.00 656.00 504.00 0.75 re f
+/F1 10.30 Tf
+0.140 0.140 0.160 rg
+1 0 0 1 54.00 637.00 Tm
+(rest_ext is a DuckDB extension that lets any REST API be queried with plain SQL. A user ATTACHes an API) Tj
+1 0 0 1 54.00 623.00 Tm
+(the same way they would ATTACH a Postgres or MySQL database, and every endpoint becomes a callable) Tj
+1 0 0 1 54.00 609.00 Tm
+(table function returning rows whose schema is inferred automatically from the API's own JSON responses. No) Tj
+1 0 0 1 54.00 595.00 Tm
+(connectors, no per-API code, no ETL scripts - configuration alone is enough to turn a REST API into a) Tj
+1 0 0 1 54.00 581.00 Tm
+(SQL-queryable data source.) Tj
+/F2 13.50 Tf
+0.110 0.320 0.550 rg
+1 0 0 1 54.00 551.00 Tm
+(Problem) Tj
+0.110 0.320 0.550 rg
+54.00 530.00 504.00 0.75 re f
+/F1 10.30 Tf
+0.140 0.140 0.160 rg
+1 0 0 1 54.00 511.00 Tm
+(DuckDB already has first-class scanners for relational databases \(postgres_scanner, mysql_scanner\) and for) Tj
+1 0 0 1 54.00 497.00 Tm
+(flat files \(read_json, read_csv, read_parquet\). It has no equivalent for the REST APIs that a large share of) Tj
+1 0 0 1 54.00 483.00 Tm
+(real-world "cost and usage" data actually lives behind - cloud billing APIs, SaaS admin consoles, internal) Tj
+1 0 0 1 54.00 469.00 Tm
+(microservices. Today, getting that data into DuckDB means writing and maintaining a bespoke script per API:) Tj
+1 0 0 1 54.00 455.00 Tm
+(handling auth, pagination-adjacent request shaping, and flattening JSON into rows by hand.) Tj
+1 0 0 1 54.00 433.00 Tm
+(The concrete motivating case: pulling Google Workspace Admin SDK cost and usage reports into DuckDB for) Tj
+1 0 0 1 54.00 419.00 Tm
+(analysis. That API - like most REST APIs - needs an authenticated request to a JSON-returning endpoint.) Tj
+1 0 0 1 54.00 405.00 Tm
+(Nothing about that is Google-specific; the same shape covers GCP billing exports, Stripe, GitHub, or any) Tj
+1 0 0 1 54.00 391.00 Tm
+(internal service with an OpenAPI spec.) Tj
+/F2 13.50 Tf
+0.110 0.320 0.550 rg
+1 0 0 1 54.00 361.00 Tm
+(Proposed Solution) Tj
+0.110 0.320 0.550 rg
+54.00 340.00 504.00 0.75 re f
+/F1 10.30 Tf
+0.140 0.140 0.160 rg
+1 0 0 1 54.00 321.00 Tm
+(rest_ext treats a REST API as an attachable database:) Tj
+/F3 8.60 Tf
+0.200 0.200 0.220 rg
+1 0 0 1 64.00 282.40 Tm
+(INSTALL rest_ext;) Tj
+1 0 0 1 64.00 270.19 Tm
+(LOAD rest_ext;) Tj
+1 0 0 1 64.00 257.98 Tm
+(ATTACH '<config>' AS myapi \(TYPE rest_ext, ...\);) Tj
+1 0 0 1 64.00 245.76 Tm
+(SELECT * FROM myapi.<endpoint>\(query_params, body\);) Tj
+/F1 10.30 Tf
+0.140 0.140 0.160 rg
+1 0 0 1 54.00 218.15 Tm
+(Three ways to configure an attachment, in increasing order of power:) Tj
+0.110 0.320 0.550 rg
+1 0 0 1 68.00 199.15 Tm
+(•) Tj
+0.140 0.140 0.160 rg
+1 0 0 1 80.00 199.15 Tm
+(Single endpoint - just a URL, headers, and method. Produces one bare callable.) Tj
+0.110 0.320 0.550 rg
+1 0 0 1 68.00 180.15 Tm
+(•) Tj
+0.140 0.140 0.160 rg
+1 0 0 1 80.00 180.15 Tm
+(Namespace - a hand-written map of name -> URL. Produces one callable per name, dot-qualified) Tj
+1 0 0 1 80.00 166.15 Tm
+(\(myapi.Users\(...\), myapi.Orders\(...\)\).) Tj
+0.110 0.320 0.550 rg
+1 0 0 1 68.00 147.15 Tm
+(•) Tj
+0.140 0.140 0.160 rg
+1 0 0 1 80.00 147.15 Tm
+(OpenAPI spec-import - point ATTACH at an OpenAPI 2.0 or 3.x document \(a local file or a remote) Tj
+1 0 0 1 80.00 133.15 Tm
+(SPEC_URL\), and every operation the spec defines becomes a callable automatically, already wired to) Tj
+1 0 0 1 80.00 119.15 Tm
+(the right URL, method, and path.) Tj
+1 0 0 1 54.00 97.15 Tm
+(In every mode, the response schema is not fixed up front - it is inferred from the actual JSON returned, at) Tj
+1 0 0 1 54.00 83.15 Tm
+(query-bind time. A JSON object becomes a STRUCT column, an array becomes a LIST column, and scalars) Tj
+/F1 8.00 Tf
+0.460 0.460 0.480 rg
+1 0 0 1 248.93 30.00 Tm
+(rest_ext Proposal  |  Page 1 of 5) Tj
+Q
+endstream
+endobj
+8 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R >> >> /Contents 9 0 R >>
+endobj
+9 0 obj
+<< /Length 3868 >>
+stream
+q
+0.950 0.955 0.965 rg
+44.00 270.58 524.00 40.42 re f
+0.110 0.320 0.550 rg
+44.00 270.58 3.00 40.42 re f
+0.950 0.955 0.965 rg
+44.00 165.94 524.00 52.64 re f
+0.110 0.320 0.550 rg
+44.00 165.94 3.00 52.64 re f
+/F1 10.30 Tf
+0.140 0.140 0.160 rg
+1 0 0 1 54.00 736.00 Tm
+(map to native DuckDB types. Path parameters \(/pets/{petId}\) are filled in from the same query-params object a) Tj
+1 0 0 1 54.00 722.00 Tm
+(caller already passes, with no separate syntax to learn.) Tj
+1 0 0 1 54.00 700.00 Tm
+(Authentication is handled generically, independent of any one provider's scheme: headers can be supplied) Tj
+1 0 0 1 54.00 686.00 Tm
+(inline, or stored once via CREATE SECRET and matched to a target URL automatically, exactly like DuckDB's) Tj
+1 0 0 1 54.00 672.00 Tm
+(existing S3/httpfs secrets.) Tj
+/F2 13.50 Tf
+0.110 0.320 0.550 rg
+1 0 0 1 54.00 642.00 Tm
+(Architecture) Tj
+0.110 0.320 0.550 rg
+54.00 621.00 504.00 0.75 re f
+/F1 10.30 Tf
+1 0 0 1 68.00 605.00 Tm
+(•) Tj
+0.140 0.140 0.160 rg
+1 0 0 1 80.00 605.00 Tm
+(Storage extension + custom Catalog - ATTACH is backed by DuckDB's StorageExtension interface \(the) Tj
+1 0 0 1 80.00 591.00 Tm
+(same mechanism postgres_scanner uses\), not a one-off scalar function, so attachments behave like real) Tj
+1 0 0 1 80.00 577.00 Tm
+(databases: DETACH cleans up fully, and namespace mode gets a real Catalog/Schema per attachment.) Tj
+0.110 0.320 0.550 rg
+1 0 0 1 68.00 558.00 Tm
+(•) Tj
+0.140 0.140 0.160 rg
+1 0 0 1 80.00 558.00 Tm
+(Dynamic schema inference - the HTTP call happens at bind time so the JSON response shape can) Tj
+1 0 0 1 80.00 544.00 Tm
+(determine output columns before DuckDB needs them, rather than requiring a schema to be declared up) Tj
+1 0 0 1 80.00 530.00 Tm
+(front.) Tj
+0.110 0.320 0.550 rg
+1 0 0 1 68.00 511.00 Tm
+(•) Tj
+0.140 0.140 0.160 rg
+1 0 0 1 80.00 511.00 Tm
+(Generic HTTP layer - one shared request path \(built on cpp-httplib with TLS\) handles headers, query) Tj
+1 0 0 1 80.00 497.00 Tm
+(parameters, JSON bodies, and {parameter} path-template substitution for every mode and every method) Tj
+1 0 0 1 80.00 483.00 Tm
+(\(GET/POST/PUT/PATCH/DELETE\).) Tj
+0.110 0.320 0.550 rg
+1 0 0 1 68.00 464.00 Tm
+(•) Tj
+0.140 0.140 0.160 rg
+1 0 0 1 80.00 464.00 Tm
+(OpenAPI import - parses both the modern servers-array style \(3.x, including server variables and relative) Tj
+1 0 0 1 80.00 450.00 Tm
+(server URLs\) and the legacy host/basePath/schemes style \(2.0\), so either generation of spec works) Tj
+1 0 0 1 80.00 436.00 Tm
+(unmodified.) Tj
+0.110 0.320 0.550 rg
+1 0 0 1 68.00 417.00 Tm
+(•) Tj
+0.140 0.140 0.160 rg
+1 0 0 1 80.00 417.00 Tm
+(Secrets integration - a dedicated rest_ext_headers secret type, redacted in duckdb_secrets\(\), resolved) Tj
+1 0 0 1 80.00 403.00 Tm
+(per-request by longest-scope-prefix match against the target URL.) Tj
+/F2 13.50 Tf
+0.110 0.320 0.550 rg
+1 0 0 1 54.00 373.00 Tm
+(Demonstration: the Swagger Petstore API) Tj
+0.110 0.320 0.550 rg
+54.00 352.00 504.00 0.75 re f
+/F1 10.30 Tf
+0.140 0.140 0.160 rg
+1 0 0 1 54.00 333.00 Tm
+(No local file needed - SPEC_URL fetches the spec directly from the live API:) Tj
+/F3 8.60 Tf
+0.200 0.200 0.220 rg
+1 0 0 1 64.00 294.40 Tm
+(ATTACH 'petstore' AS petstore \(TYPE rest_ext, FORMAT 'openapi',) Tj
+1 0 0 1 64.00 282.19 Tm
+(    SPEC_URL 'https://petstore3.swagger.io/api/v3/openapi.json'\);) Tj
+/F1 10.30 Tf
+0.140 0.140 0.160 rg
+1 0 0 1 54.00 254.58 Tm
+(Every operation in the spec \(findPetsByStatus, getPetById, addPet, ...\) is now a callable, already pointed at) Tj
+1 0 0 1 54.00 240.58 Tm
+(the right URL and method:) Tj
+/F3 8.60 Tf
+0.200 0.200 0.220 rg
+1 0 0 1 64.00 201.98 Tm
+(SELECT id, name, status) Tj
+1 0 0 1 64.00 189.76 Tm
+(FROM petstore.findPetsByStatus\('{"status":"available"}', '{}'\)) Tj
+1 0 0 1 64.00 177.55 Tm
+(LIMIT 5;) Tj
+/F1 8.00 Tf
+0.460 0.460 0.480 rg
+1 0 0 1 248.93 30.00 Tm
+(rest_ext Proposal  |  Page 2 of 5) Tj
+Q
+endstream
+endobj
+10 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R >> >> /Contents 11 0 R >>
+endobj
+11 0 obj
+<< /Length 5426 >>
+stream
+q
+0.110 0.320 0.550 rg
+54.00 686.00 504.00 20.00 re f
+0.955 0.960 0.965 rg
+54.00 646.00 504.00 20.00 re f
+0.955 0.960 0.965 rg
+54.00 606.00 504.00 20.00 re f
+0.720 0.740 0.780 RG
+0.6 w
+54.00 706.00 m 558.00 706.00 l S
+54.00 686.00 m 558.00 686.00 l S
+54.00 666.00 m 558.00 666.00 l S
+54.00 646.00 m 558.00 646.00 l S
+54.00 626.00 m 558.00 626.00 l S
+54.00 606.00 m 558.00 606.00 l S
+54.00 586.00 m 558.00 586.00 l S
+54.00 706.00 m 54.00 586.00 l S
+230.05 706.00 m 230.05 586.00 l S
+449.67 706.00 m 449.67 586.00 l S
+558.00 706.00 m 558.00 586.00 l S
+0.950 0.955 0.965 rg
+44.00 493.58 524.00 40.42 re f
+0.110 0.320 0.550 rg
+44.00 493.58 3.00 40.42 re f
+0.110 0.320 0.550 rg
+54.00 435.58 504.00 20.00 re f
+0.720 0.740 0.780 RG
+0.6 w
+54.00 455.58 m 558.00 455.58 l S
+54.00 435.58 m 558.00 435.58 l S
+54.00 415.58 m 558.00 415.58 l S
+54.00 455.58 m 54.00 415.58 l S
+298.50 455.58 m 298.50 415.58 l S
+407.55 455.58 m 407.55 415.58 l S
+558.00 455.58 m 558.00 415.58 l S
+0.110 0.320 0.550 rg
+54.00 217.58 504.00 20.00 re f
+0.955 0.960 0.965 rg
+54.00 177.58 504.00 20.00 re f
+0.720 0.740 0.780 RG
+0.6 w
+54.00 237.58 m 558.00 237.58 l S
+54.00 217.58 m 558.00 217.58 l S
+54.00 197.58 m 558.00 197.58 l S
+54.00 177.58 m 558.00 177.58 l S
+54.00 237.58 m 54.00 177.58 l S
+135.24 237.58 m 135.24 177.58 l S
+392.11 237.58 m 392.11 177.58 l S
+558.00 237.58 m 558.00 177.58 l S
+/F1 10.30 Tf
+0.140 0.140 0.160 rg
+1 0 0 1 54.00 728.00 Tm
+(Result:) Tj
+/F2 9.20 Tf
+1.000 1.000 1.000 rg
+1 0 0 1 60.00 693.06 Tm
+(id) Tj
+1 0 0 1 236.05 693.06 Tm
+(name) Tj
+1 0 0 1 455.67 693.06 Tm
+(status) Tj
+/F1 9.20 Tf
+0.140 0.140 0.160 rg
+1 0 0 1 60.00 673.06 Tm
+(1790355770971) Tj
+1 0 0 1 236.05 673.06 Tm
+(Rex-1790355770971) Tj
+1 0 0 1 455.67 673.06 Tm
+(available) Tj
+1 0 0 1 60.00 653.06 Tm
+(1790355837460) Tj
+1 0 0 1 236.05 653.06 Tm
+(Rex-1790355837460) Tj
+1 0 0 1 455.67 653.06 Tm
+(available) Tj
+1 0 0 1 60.00 633.06 Tm
+(1790355839043) Tj
+1 0 0 1 236.05 633.06 Tm
+(Rex-1790355839043) Tj
+1 0 0 1 455.67 633.06 Tm
+(available) Tj
+1 0 0 1 60.00 613.06 Tm
+(1790356921263) Tj
+1 0 0 1 236.05 613.06 Tm
+(Rex) Tj
+1 0 0 1 455.67 613.06 Tm
+(available) Tj
+1 0 0 1 60.00 593.06 Tm
+(1790356930581) Tj
+1 0 0 1 236.05 593.06 Tm
+(Rex-1790356930581) Tj
+1 0 0 1 455.67 593.06 Tm
+(available) Tj
+/F1 10.30 Tf
+1 0 0 1 54.00 570.00 Tm
+(A path parameter \(/pet/{petId}\) is filled in from the same query-params object, with no separate placeholder) Tj
+1 0 0 1 54.00 556.00 Tm
+(syntax:) Tj
+/F3 8.60 Tf
+0.200 0.200 0.220 rg
+1 0 0 1 64.00 517.40 Tm
+(SELECT id, name, status) Tj
+1 0 0 1 64.00 505.19 Tm
+(FROM petstore.getPetById\('{"petId":"1790356921263"}', '{}'\);) Tj
+/F1 10.30 Tf
+0.140 0.140 0.160 rg
+1 0 0 1 54.00 477.58 Tm
+(Result:) Tj
+/F2 9.20 Tf
+1.000 1.000 1.000 rg
+1 0 0 1 60.00 442.63 Tm
+(id) Tj
+1 0 0 1 304.50 442.63 Tm
+(name) Tj
+1 0 0 1 413.55 442.63 Tm
+(status) Tj
+/F1 9.20 Tf
+0.140 0.140 0.160 rg
+1 0 0 1 60.00 422.63 Tm
+(1790356921263) Tj
+1 0 0 1 304.50 422.63 Tm
+(Rex) Tj
+1 0 0 1 413.55 422.63 Tm
+(available) Tj
+/F1 10.30 Tf
+1 0 0 1 54.00 399.58 Tm
+(Nothing about findPetsByStatus or getPetById was hand-written for this demo - both came directly out of) Tj
+1 0 0 1 54.00 385.58 Tm
+(parsing the spec.) Tj
+/F2 13.50 Tf
+0.110 0.320 0.550 rg
+1 0 0 1 54.00 355.58 Tm
+(Applying This: Google Workspace Admin Console Usage Reports) Tj
+0.110 0.320 0.550 rg
+54.00 334.58 504.00 0.75 re f
+/F1 10.30 Tf
+0.140 0.140 0.160 rg
+1 0 0 1 54.00 315.58 Tm
+(This is the original motivating case: pulling usage data - and, by extension, the license counts that drive) Tj
+1 0 0 1 54.00 301.58 Tm
+(per-seat cost - out of the Google Workspace Admin Console, without writing a Google-specific integration.) Tj
+1 0 0 1 54.00 287.58 Tm
+(Google publishes this as the Admin SDK Reports API, a real, documented REST API \(base URL) Tj
+1 0 0 1 54.00 273.58 Tm
+(https://admin.googleapis.com\), with no spec-import needed - two endpoints, configured by hand in namespace) Tj
+1 0 0 1 54.00 259.58 Tm
+(mode, cover the whole reporting surface:) Tj
+/F2 9.20 Tf
+1.000 1.000 1.000 rg
+1 0 0 1 60.00 224.63 Tm
+(Report) Tj
+1 0 0 1 141.24 224.63 Tm
+(Method & Path) Tj
+1 0 0 1 398.11 224.63 Tm
+(Key Parameters) Tj
+/F1 9.20 Tf
+0.140 0.140 0.160 rg
+1 0 0 1 60.00 204.63 Tm
+(Customer usage) Tj
+1 0 0 1 141.24 204.63 Tm
+(GET /admin/reports/v1/usage/dates/{date}) Tj
+1 0 0 1 398.11 204.63 Tm
+(customerId, parameters, maxResults) Tj
+1 0 0 1 60.00 184.63 Tm
+(User usage) Tj
+1 0 0 1 141.24 184.63 Tm
+(GET /admin/reports/v1/usage/users/{userKey}/dates/{date}) Tj
+1 0 0 1 398.11 184.63 Tm
+(customerId, parameters, filters) Tj
+/F1 10.30 Tf
+1 0 0 1 54.00 161.58 Tm
+(parameters is a comma-separated list of app:field names. The customer usage report's accounts app exposes) Tj
+1 0 0 1 54.00 147.58 Tm
+(exactly the license/quota figures that drive Workspace's per-seat billing - accounts:apps_total_licenses,) Tj
+1 0 0 1 54.00 133.58 Tm
+(accounts:apps_used_licenses, accounts:used_quota_in_mb - the closest real, documented proxy this API) Tj
+1 0 0 1 54.00 119.58 Tm
+(offers to "cost" \(a true dollar figure is a Cloud Billing / BigQuery-export concern, one layer up from Workspace) Tj
+1 0 0 1 54.00 105.58 Tm
+(itself; license consumption is what Workspace usage reporting actually tracks\).) Tj
+1 0 0 1 54.00 83.58 Tm
+(Configuring both endpoints is the same namespace-mode pattern used everywhere else in this proposal, with) Tj
+/F1 8.00 Tf
+0.460 0.460 0.480 rg
+1 0 0 1 248.93 30.00 Tm
+(rest_ext Proposal  |  Page 3 of 5) Tj
+Q
+endstream
+endobj
+12 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R >> >> /Contents 13 0 R >>
+endobj
+13 0 obj
+<< /Length 4664 >>
+stream
+q
+0.950 0.955 0.965 rg
+44.00 508.98 524.00 205.02 re f
+0.110 0.320 0.550 rg
+44.00 508.98 3.00 205.02 re f
+0.950 0.955 0.965 rg
+44.00 392.13 524.00 64.85 re f
+0.110 0.320 0.550 rg
+44.00 392.13 3.00 64.85 re f
+/F1 10.30 Tf
+0.140 0.140 0.160 rg
+1 0 0 1 54.00 736.00 Tm
+(a bearer token stored once as a secret scoped to Google's host:) Tj
+/F3 7.83 Tf
+0.200 0.200 0.220 rg
+1 0 0 1 64.00 698.17 Tm
+(CREATE SECRET \() Tj
+1 0 0 1 64.00 687.05 Tm
+(    TYPE rest_ext_headers,) Tj
+1 0 0 1 64.00 675.93 Tm
+(    HEADERS MAP {'Authorization': 'Bearer <oauth2-access-token>'},) Tj
+1 0 0 1 64.00 664.81 Tm
+(    SCOPE 'https://admin.googleapis.com') Tj
+1 0 0 1 64.00 653.69 Tm
+(\);) Tj
+1 0 0 1 64.00 642.58 Tm
+() Tj
+1 0 0 1 64.00 631.46 Tm
+(ATTACH 'resources={) Tj
+1 0 0 1 64.00 620.34 Tm
+(    "CustomerUsage":"https://admin.googleapis.com/admin/reports/v1/usage/dates/{date}",) Tj
+1 0 0 1 64.00 609.22 Tm
+(    "UserUsage":"https://admin.googleapis.com/admin/reports/v1/usage/users/{userKey}/dates/{date}") Tj
+1 0 0 1 64.00 598.10 Tm
+(}' AS gadmin \(TYPE rest_ext\);) Tj
+1 0 0 1 64.00 586.98 Tm
+() Tj
+1 0 0 1 64.00 575.86 Tm
+(SELECT *) Tj
+1 0 0 1 64.00 564.74 Tm
+(FROM gadmin.CustomerUsage\() Tj
+1 0 0 1 64.00 553.62 Tm
+(    '{"date":"2026-09-01","customerId":"my_customer",) Tj
+1 0 0 1 64.00 542.51 Tm
+(      "parameters":"accounts:apps_total_licenses,accounts:apps_used_licenses,accounts:used_quota_in_mb"}',) Tj
+1 0 0 1 64.00 531.39 Tm
+(    '{}') Tj
+1 0 0 1 64.00 520.27 Tm
+(\);) Tj
+/F1 10.30 Tf
+0.140 0.140 0.160 rg
+1 0 0 1 54.00 492.98 Tm
+(This was run against Google's real, live endpoint \(with a placeholder bearer token, not a valid one\) to confirm) Tj
+1 0 0 1 54.00 478.98 Tm
+(the request actually reaches it correctly:) Tj
+/F3 8.60 Tf
+0.200 0.200 0.220 rg
+1 0 0 1 64.00 440.38 Tm
+(IO Error: rest_ext: HTTP request to) Tj
+1 0 0 1 64.00 428.17 Tm
+("https://admin.googleapis.com/admin/reports/v1/usage/dates/2026-09-01" returned status 401:) Tj
+1 0 0 1 64.00 415.96 Tm
+({"error": {"code": 401, "message": "Request had invalid authentication credentials. ...",) Tj
+1 0 0 1 64.00 403.74 Tm
+(           "status": "UNAUTHENTICATED"}}) Tj
+/F1 10.30 Tf
+0.140 0.140 0.160 rg
+1 0 0 1 54.00 376.13 Tm
+(The {date} path parameter was substituted correctly, and Google's own server answered with its real,) Tj
+1 0 0 1 54.00 362.13 Tm
+(documented 401 response for a missing/invalid token - not a connection failure or a client-side parsing error. A) Tj
+1 0 0 1 54.00 348.13 Tm
+(valid OAuth 2 access token \(scope https://www.googleapis.com/auth/admin.reports.usage.readonly\) is the) Tj
+1 0 0 1 54.00 334.13 Tm
+(only missing piece for this to return real usage rows.) Tj
+/F2 13.50 Tf
+0.110 0.320 0.550 rg
+1 0 0 1 54.00 304.13 Tm
+(Status and Validation) Tj
+0.110 0.320 0.550 rg
+54.00 283.13 504.00 0.75 re f
+/F1 10.30 Tf
+0.140 0.140 0.160 rg
+1 0 0 1 54.00 264.13 Tm
+(The extension has been validated end-to-end against three classes of API, not just synthetic fixtures:) Tj
+0.110 0.320 0.550 rg
+1 0 0 1 68.00 245.13 Tm
+(•) Tj
+0.140 0.140 0.160 rg
+1 0 0 1 80.00 245.13 Tm
+(Long-stable public test data \(jsonplaceholder.typicode.com\) - the primary regression suite, covering) Tj
+1 0 0 1 80.00 231.13 Tm
+(single-endpoint mode, namespace mode, dynamic schema inference for nested JSON, secrets) Tj
+1 0 0 1 80.00 217.13 Tm
+(\(redaction, override precedence, per-host resolution\), and OpenAPI spec-import mechanics \(operationId) Tj
+1 0 0 1 80.00 203.13 Tm
+(naming, path parameters, server-variable substitution, error paths\).) Tj
+0.110 0.320 0.550 rg
+1 0 0 1 68.00 184.13 Tm
+(•) Tj
+0.140 0.140 0.160 rg
+1 0 0 1 80.00 184.13 Tm
+(The live OpenAPI 3.x Swagger Petstore - validates spec-import against a real, unmodified, third-party) Tj
+1 0 0 1 80.00 170.13 Tm
+(spec, including a relative servers URL \(a real, standard OpenAPI pattern the spec author used, resolved) Tj
+1 0 0 1 80.00 156.13 Tm
+(against wherever the spec itself was fetched from\).) Tj
+0.110 0.320 0.550 rg
+1 0 0 1 68.00 137.13 Tm
+(•) Tj
+0.140 0.140 0.160 rg
+1 0 0 1 80.00 137.13 Tm
+(The live Swagger 2.0 \("legacy"\) Petstore - validates the older host/basePath/schemes base-URL) Tj
+1 0 0 1 80.00 123.13 Tm
+(convention against a real spec, exercising the one code path the jsonplaceholder-based suite alone) Tj
+1 0 0 1 80.00 109.13 Tm
+(never touched.) Tj
+1 0 0 1 54.00 87.13 Tm
+(These live-API checks run as a separate, explicitly-invoked test suite \(.test_slow\), kept apart from the default) Tj
+1 0 0 1 54.00 73.13 Tm
+(regression suite since they depend on outbound network access and a third party's uptime and data.) Tj
+/F1 8.00 Tf
+0.460 0.460 0.480 rg
+1 0 0 1 248.93 30.00 Tm
+(rest_ext Proposal  |  Page 4 of 5) Tj
+Q
+endstream
+endobj
+14 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R >> >> /Contents 15 0 R >>
+endobj
+15 0 obj
+<< /Length 1289 >>
+stream
+q
+/F2 13.50 Tf
+0.110 0.320 0.550 rg
+1 0 0 1 54.00 720.00 Tm
+(Next Steps) Tj
+0.110 0.320 0.550 rg
+54.00 699.00 504.00 0.75 re f
+/F1 10.30 Tf
+1 0 0 1 68.00 683.00 Tm
+(•) Tj
+0.140 0.140 0.160 rg
+1 0 0 1 80.00 683.00 Tm
+(Parse OpenAPI security schemes directly from a spec \(API key / bearer / basic\), so a spec's own) Tj
+1 0 0 1 80.00 669.00 Tm
+(declared auth requirement can suggest the right CREATE SECRET shape instead of the caller having to) Tj
+1 0 0 1 80.00 655.00 Tm
+(already know it.) Tj
+0.110 0.320 0.550 rg
+1 0 0 1 68.00 636.00 Tm
+(•) Tj
+0.140 0.140 0.160 rg
+1 0 0 1 80.00 636.00 Tm
+(Apply the extension to the original motivating case - Google Workspace Admin SDK reports - as the first) Tj
+1 0 0 1 80.00 622.00 Tm
+(real, non-demo integration, using OpenAPI spec-import against Google's own published discovery) Tj
+1 0 0 1 80.00 608.00 Tm
+(documents where available.) Tj
+0.110 0.320 0.550 rg
+1 0 0 1 68.00 589.00 Tm
+(•) Tj
+0.140 0.140 0.160 rg
+1 0 0 1 80.00 589.00 Tm
+(Investigate pagination conventions \(next_page_token, Link headers\) as a generic, opt-in layer on top of) Tj
+1 0 0 1 80.00 575.00 Tm
+(the existing per-call model, rather than a provider-specific special case.) Tj
+/F1 8.00 Tf
+0.460 0.460 0.480 rg
+1 0 0 1 248.93 30.00 Tm
+(rest_ext Proposal  |  Page 5 of 5) Tj
+Q
+endstream
+endobj
+xref
+0 16
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000142 00000 n 
+0000000239 00000 n 
+0000000341 00000 n 
+0000000436 00000 n 
+0000000582 00000 n 
+0000004815 00000 n 
+0000004961 00000 n 
+0000008881 00000 n 
+0000009029 00000 n 
+0000014508 00000 n 
+0000014656 00000 n 
+0000019373 00000 n 
+0000019521 00000 n 
+trailer
+<< /Size 16 /Root 1 0 R >>
+startxref
+20863
+%%EOF
