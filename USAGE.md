@@ -7,6 +7,20 @@ schema inferred from the JSON response - nested objects become `STRUCT` columns,
 
 ## Quick start
 
+Don't want to build it yourself? Install the prebuilt Linux x86_64 binary straight from this repo:
+
+```sql
+SET custom_extension_repository='https://raw.githubusercontent.com/BrianHardyR/rest-ext-duckdb/main/dist-repo';
+SET allow_unsigned_extensions=true;
+INSTALL rest_ext;
+LOAD rest_ext;
+```
+
+(This binary isn't signed with DuckDB's official key, hence `allow_unsigned_extensions`. Other
+platforms - macOS, Windows, arm64 - aren't built yet; build from source below for those.)
+
+Otherwise, build from source:
+
 ```sh
 make
 ./build/release/duckdb
