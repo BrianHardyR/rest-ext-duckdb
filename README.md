@@ -76,6 +76,31 @@ CREATE SECRET (
 See [USAGE.md](USAGE.md) for the full walkthrough, and `test/sql/rest_ext.test` /
 `test/sql/rest_ext_openapi_live.test_slow` for more worked examples.
 
+## Supported DuckDB versions
+
+| | |
+|---|---|
+| Prebuilt binaries | `linux_amd64` only, for DuckDB **v1.3.2, v1.4.5, and v1.5.5** - `INSTALL` fetches whichever matches your running DuckDB automatically |
+| Build from source | any other DuckDB version/platform - see [Cross-version compatibility](#cross-version-compatibility) below |
+
+## Limitations
+
+- OpenAPI (2.0/3.x) is the only supported spec format - convert other formats (e.g. Postman) to
+  OpenAPI first.
+- One HTTP call per table-function invocation, so no built-in pagination: an API that returns
+  results a page at a time (e.g. a `next_cursor`/`next_page_token` field, or a `Link` header) only
+  gets you that one page per call - `rest_ext` doesn't follow cursors or walk subsequent pages
+  automatically. Paging through results means issuing repeat calls yourself (e.g. a recursive CTE
+  or a loop in application code) with each page's cursor value passed back in as a query param.
+- OpenAPI security schemes aren't parsed - configure auth via `CREATE SECRET`/`headers=` instead.
+- Namespace mode's hand-written `resources={...}` gives every resource the same HTTP method; use
+  OpenAPI import for a mix of GET/POST/etc.
+- Prebuilt binaries only cover `linux_amd64` on the three DuckDB versions above; a DuckDB release
+  outside that range may hit a not-yet-handled internal API change when built from source (DuckDB's
+  extension C++ API isn't ABI-stable across releases - see below).
+
+See [USAGE.md](USAGE.md#limitations) for the full list with more detail.
+
 ## Development
 
 Built on the [DuckDB extension template](https://github.com/duckdb/extension-template).

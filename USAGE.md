@@ -528,11 +528,21 @@ FROM secretapi('{}', '{}');
 
 - OpenAPI (2.0/3.x) is the only supported spec format - convert other formats (e.g. Postman) to
   OpenAPI first.
-- One HTTP call per table-function invocation - all output rows come from that single response;
-  there's no built-in pagination/cursor following across multiple requests.
+- One HTTP call per table-function invocation, so no built-in pagination: all output rows come from
+  that single response. An API that returns results a page at a time (e.g. a
+  `next_cursor`/`next_page_token` field, or a `Link` header) only gets you that one page per call -
+  `rest_ext` doesn't follow cursors or walk subsequent pages automatically. Paging through results
+  means issuing repeat calls yourself, feeding each response's cursor value back in as the next
+  call's query param (e.g. via a recursive CTE, or a loop in whatever's driving the SQL).
 - OpenAPI security schemes aren't parsed - configure auth via `CREATE SECRET`/`headers=` instead.
 - Namespace mode's hand-written `resources={...}` gives every resource the same HTTP method; use
   OpenAPI import if you need a mix of GET/POST/etc. under one alias.
+- Prebuilt binaries are only published for `linux_amd64` on DuckDB v1.3.2, v1.4.5, and v1.5.5 (see
+  [Quick start](#quick-start)) - other platforms, or a DuckDB release outside that range, need
+  building from source. DuckDB's extension C++ API isn't ABI-stable across releases, so a DuckDB
+  version further outside the tested range may hit a not-yet-handled internal API break when
+  building from source (see `CMakeLists.txt` and `src/include/rest_ext_compat.hpp` for the
+  version-detection pattern already used to bridge v1.3.x-v1.5.x).
 
 ## Further examples
 
