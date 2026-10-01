@@ -69,26 +69,60 @@ void RegisterRestExtHeadersSecretType(DatabaseInstance &db) {
 }
 #endif
 
+// How well a secret's scopes match a URL: the longest scope that is the URL itself or a prefix of
+// it ending where a URL part ends ('/', '?' or '#', or a scope that ends in '/'); 0 for a secret
+// with no scope, which applies everywhere; -1 for no match.
+static int64_t ScopeMatchScore(const vector<string> &scopes, const string &url) {
+	if (scopes.empty()) {
+		return 0;
+	}
+	int64_t best = -1;
+	for (auto &scope : scopes) {
+		if (scope.empty()) {
+			best = MaxValue<int64_t>(best, 0);
+			continue;
+		}
+		if (!StringUtil::StartsWith(url, scope)) {
+			continue;
+		}
+		auto at_boundary = url.size() == scope.size() || scope.back() == '/' || url[scope.size()] == '/' ||
+		                   url[scope.size()] == '?' || url[scope.size()] == '#';
+		if (at_boundary) {
+			best = MaxValue<int64_t>(best, NumericCast<int64_t>(scope.size()));
+		}
+	}
+	return best;
+}
+
 string ResolveHeaders(ClientContext &context, const string &url, const string &inline_headers_json) {
 	case_insensitive_map_t<string> merged;
 
-	// Ask DuckDB's secret manager: "of all the rest_ext_headers secrets registered, which one (if
-	// any) best matches this URL?" Matching works by longest SCOPE-prefix, same as the built-in
-	// `http`/S3 secrets use - e.g. a secret scoped to "https://api.example.com/v1" would be
-	// preferred over one scoped to just "https://api.example.com" when both match.
+	// Of all the rest_ext_headers secrets, the one whose SCOPE is the longest match for this URL -
+	// e.g. "https://api.example.com/v1" beats "https://api.example.com". A scope must match up to a
+	// URL boundary: DuckDB's own LookupSecret compares bare string prefixes, under which a secret
+	// for "https://api.example.com" would also send its headers to "https://api.example.com.evil.net".
 	auto &secret_manager = SecretManager::Get(context);
 	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-	auto match = secret_manager.LookupSecret(transaction, url, "rest_ext_headers");
-	if (match.HasMatch()) {
-		auto &kv_secret = dynamic_cast<const KeyValueSecret &>(match.GetSecret());
+	int64_t best_score = -1;
+	Value best_headers;
+	for (auto &entry : secret_manager.AllSecrets(transaction)) {
+		if (!entry.secret || entry.secret->GetType() != "rest_ext_headers") {
+			continue;
+		}
+		auto score = ScopeMatchScore(entry.secret->GetScope(), url);
+		auto kv_secret = dynamic_cast<const KeyValueSecret *>(entry.secret.get());
 		Value headers_value;
-		if (kv_secret.TryGetValue("headers", headers_value)) {
-			// A MAP value's internal representation is a list of {key, value} structs - this is
-			// just how DuckDB represents any MAP as a plain Value, nothing specific to secrets.
-			for (auto &entry : MapValue::GetChildren(headers_value)) {
-				auto &kv = StructValue::GetChildren(entry);
-				merged[kv[0].ToString()] = kv[1].ToString();
-			}
+		if (score > best_score && kv_secret && kv_secret->TryGetValue("headers", headers_value)) {
+			best_score = score;
+			best_headers = headers_value;
+		}
+	}
+	if (best_score >= 0 && !best_headers.IsNull()) {
+		// A MAP value's internal representation is a list of {key, value} structs - this is just
+		// how DuckDB represents any MAP as a plain Value, nothing specific to secrets.
+		for (auto &entry : MapValue::GetChildren(best_headers)) {
+			auto &kv = StructValue::GetChildren(entry);
+			merged[kv[0].ToString()] = kv[1].ToString();
 		}
 	}
 

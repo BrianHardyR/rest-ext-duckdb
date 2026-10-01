@@ -9,6 +9,7 @@
 #include "spec_import.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/common/http_util.hpp"
@@ -112,6 +113,134 @@ static void ParseRestAttachPath(const string &path, string &url, string &headers
 	}
 }
 
+#ifdef REST_EXT_HAS_ATTACH_OPTIONS
+using RestAttachOptionSource = AttachOptions;
+#else
+using RestAttachOptionSource = AttachInfo;
+#endif
+
+// Reads a rest_ext option and removes it, since for a url=... endpoint DuckDB goes on to hand the
+// remaining options to its own in-memory storage, which refuses any it doesn't know.
+static string TakeAttachOptionCI(RestAttachOptionSource &options, const string &key) {
+	for (auto it = options.options.begin(); it != options.options.end(); it++) {
+		if (StringUtil::CIEquals(it->first, key)) {
+			auto value = it->second.ToString();
+			options.options.erase(it);
+			return value;
+		}
+	}
+	return string();
+}
+
+static string ReadPointerOption(RestAttachOptionSource &options, const string &key) {
+	auto pointer = TakeAttachOptionCI(options, key);
+	if (!pointer.empty() && pointer[0] != '/') {
+		throw BinderException("rest_ext: %s must be a JSON pointer starting with '/', e.g. '/data' (got \"%s\")",
+		                      StringUtil::Upper(key), pointer);
+	}
+	return pointer;
+}
+
+// The pagination ATTACH options (see RestPagination), checked for combinations that can't work.
+// COLUMN_TYPES may name the types JsonToValue can build from JSON: BOOLEAN, BIGINT, DOUBLE, VARCHAR,
+// and LISTs and STRUCTs of them.
+static bool IsJsonReadableType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::BOOLEAN:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::VARCHAR:
+		return true;
+	case LogicalTypeId::LIST:
+		return IsJsonReadableType(ListType::GetChildType(type));
+	case LogicalTypeId::STRUCT:
+		for (auto &child : StructType::GetChildTypes(type)) {
+			if (!IsJsonReadableType(child.second)) {
+				return false;
+			}
+		}
+		return true;
+	default:
+		return false;
+	}
+}
+
+static RestPagination ReadPagination(ClientContext &context, RestAttachOptionSource &options) {
+	RestPagination paging;
+	paging.items = ReadPointerOption(options, "items");
+	paging.next_url = ReadPointerOption(options, "next_url");
+	paging.next_token = ReadPointerOption(options, "next_token");
+	paging.token_body = ReadPointerOption(options, "token_body");
+	paging.token_param = TakeAttachOptionCI(options, "token_param");
+	paging.page_param = TakeAttachOptionCI(options, "page_param");
+	paging.offset_param = TakeAttachOptionCI(options, "offset_param");
+	auto integer_option = [&](const string &key, int64_t minimum) -> std::pair<bool, int64_t> {
+		auto text = TakeAttachOptionCI(options, key);
+		if (text.empty()) {
+			return {false, 0};
+		}
+		int64_t parsed = 0;
+		if (!TryCast::Operation<string_t, int64_t>(string_t(text), parsed) || parsed < minimum) {
+			throw BinderException("rest_ext: %s must be an integer of at least %lld (got \"%s\")", StringUtil::Upper(key),
+			                      static_cast<long long>(minimum), text);
+		}
+		return {true, parsed};
+	};
+	auto max_pages = integer_option("max_pages", 1);
+	if (max_pages.first) {
+		paging.max_pages = static_cast<idx_t>(max_pages.second);
+	}
+	auto page_start = integer_option("page_start", 0);
+	auto page_size = integer_option("page_size", 1);
+	paging.page_start = page_start.second;
+	paging.page_size = static_cast<idx_t>(page_size.second);
+	paging.columns = ReadPointerOption(options, "columns");
+	paging.column_types_json = TakeAttachOptionCI(options, "column_types");
+	if (!paging.column_types_json.empty()) {
+		ParseFlatJsonObject(paging.column_types_json, [&](const string &name, const string &type_name) {
+			auto type = TransformStringToLogicalType(type_name, context);
+			if (!IsJsonReadableType(type)) {
+				throw BinderException("rest_ext: COLUMN_TYPES type for \"%s\" must be BOOLEAN, BIGINT, DOUBLE, VARCHAR, or "
+				                      "a LIST or STRUCT of those (got \"%s\"); CAST in the query for anything else",
+				                      name, type_name);
+			}
+			paging.column_types.emplace_back(name, type);
+		});
+	}
+	auto styles = (paging.next_url.empty() ? 0 : 1) + (paging.next_token.empty() ? 0 : 1) +
+	              (paging.page_param.empty() ? 0 : 1) + (paging.offset_param.empty() ? 0 : 1);
+	if (styles > 1) {
+		throw BinderException("rest_ext: set one of NEXT_URL, NEXT_TOKEN, PAGE_PARAM and OFFSET_PARAM, not several");
+	}
+	if (page_start.first && paging.page_param.empty()) {
+		throw BinderException("rest_ext: PAGE_START only applies with PAGE_PARAM");
+	}
+	if (page_size.first && !paging.Counts()) {
+		throw BinderException("rest_ext: PAGE_SIZE only applies with PAGE_PARAM or OFFSET_PARAM");
+	}
+	auto token_targets = (paging.token_body.empty() ? 0 : 1) + (paging.token_param.empty() ? 0 : 1);
+	if (!paging.next_token.empty() && token_targets != 1) {
+		throw BinderException("rest_ext: NEXT_TOKEN needs exactly one of TOKEN_BODY or TOKEN_PARAM, to say where the "
+		                      "cursor goes in the next request");
+	}
+	if (paging.next_token.empty() && token_targets != 0) {
+		throw BinderException("rest_ext: TOKEN_BODY and TOKEN_PARAM only apply with NEXT_TOKEN");
+	}
+	return paging;
+}
+
+// ATTACH reaches the network (and, for FORMAT openapi without SPEC_URL, the local filesystem), so it
+// honours enable_external_access=false like DuckDB's own file readers do. Endpoints attached before
+// the setting was turned off keep working - the same as an already-attached database - which lets a
+// host attach the endpoints it allows and then lock the database against attaching any more.
+static void RequireExternalAccess(ClientContext &context) {
+	Value enabled;
+	if (context.TryGetCurrentSetting("enable_external_access", enabled) && !enabled.IsNull() &&
+	    !BooleanValue::Get(enabled)) {
+		throw PermissionException("rest_ext: ATTACH is disabled because enable_external_access is false");
+	}
+}
+
 // The `attach` callback: this runs once, when a user executes an ATTACH statement naming our
 // extension. It has to return a Catalog (DuckDB will throw an internal error if we return
 // nullptr), which is why even single-endpoint mode - which doesn't really need a "database" in any
@@ -131,13 +260,21 @@ static unique_ptr<Catalog> RestAttach(StorageExtensionInfo *storage_info, Client
                                       AccessMode access_mode) {
 	auto &attach_options = info;
 #endif
+	RequireExternalAccess(context);
+
 	// FORMAT switches ATTACH into "import from an OpenAPI spec document" mode. See spec_import.hpp
 	// for the full explanation. The spec document itself comes from one of two places:
 	//   - SPEC_URL, an http(s) URL fetched with our own HTTP client - required for a REMOTE spec,
 	//     since (see ReadSpecFile's comment) a URL can never go directly in the ATTACH path.
 	//   - otherwise, the ATTACH path itself, treated as a local file path.
+	auto paging = ReadPagination(context, attach_options);
+
 	auto format_option = FindAttachOptionCI(attach_options, "format");
 	if (!format_option.empty()) {
+		if (paging.ShapesResponse()) {
+			throw BinderException("rest_ext: the pagination options apply to url=... and resources=... endpoints, "
+			                      "not to FORMAT 'openapi'");
+		}
 		if (!StringUtil::CIEquals(format_option, "openapi")) {
 			throw BinderException("rest_ext: unrecognized FORMAT \"%s\" (expected 'openapi')", format_option);
 		}
@@ -187,7 +324,7 @@ static unique_ptr<Catalog> RestAttach(StorageExtensionInfo *storage_info, Client
 			// for the whole namespace - a namespace's resources can span different hosts (e.g.
 			// GCP's various services), and different hosts may match different stored secrets.
 			resources.push_back(
-			    {resource_name, resource_url, method, ResolveHeaders(context, resource_url, headers_json)});
+			    {resource_name, resource_url, method, ResolveHeaders(context, resource_url, headers_json), paging});
 		});
 		if (resources.empty()) {
 			throw BinderException("rest_ext ATTACH: resources={...} must be a non-empty JSON object mapping "
@@ -212,6 +349,7 @@ static unique_ptr<Catalog> RestAttach(StorageExtensionInfo *storage_info, Client
 	fetch_info->url = url;
 	fetch_info->headers_json = ResolveHeaders(context, url, headers_json);
 	fetch_info->method = method;
+	fetch_info->paging = paging;
 
 	// Build a TableFunction named after the ATTACH alias itself (e.g. "myapi"), so
 	// `SELECT * FROM myapi(...)` resolves to it directly - see rest_attachment_catalog.hpp's
