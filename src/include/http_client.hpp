@@ -30,4 +30,12 @@ namespace duckdb {
 string PerformRestCall(const string &url, const string &method, const string &headers_json,
                        const string &query_params_json, const string &body_json);
 
+// PerformRestCall for a URL that is already complete - e.g. a next-page link an API returned - so
+// no {placeholder} is filled in and no query parameter is appended.
+string PerformRestCallToUrl(const string &url, const string &method, const string &headers_json,
+                            const string &body_json);
+
+// The "scheme://host[:port]" a URL points at, lower-cased, for same-origin checks.
+string RestUrlOrigin(const string &url);
+
 } // namespace duckdb

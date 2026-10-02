@@ -37,10 +37,55 @@ namespace duckdb {
 // build one of these per callable resource and attach it to the TableFunction they construct via
 // `TableFunction::function_info` (see the .cpp file for why it has to be threaded through this
 // way rather than just captured in a lambda).
+// How to walk a paginated API, from the ATTACH options of the same names (see USAGE.md). Every
+// "pointer" is an RFC 6901 JSON pointer into one page's response, e.g. '/data' or
+// '/properties/nextLink'. With none of NEXT_URL, NEXT_TOKEN, PAGE_PARAM and OFFSET_PARAM set,
+// there is exactly one page.
+struct RestPagination {
+	string items;        // ITEMS: the array of rows in a page; empty = the whole response
+	string next_url;     // NEXT_URL: an absolute URL for the next page, same origin only
+	string next_token;   // NEXT_TOKEN: an opaque cursor for the next page...
+	string token_body;   // TOKEN_BODY: ...written into the request body at this pointer, or
+	string token_param;  // TOKEN_PARAM: ...sent as this query-string parameter
+	string page_param;   // PAGE_PARAM: a page number sent as this query-string parameter, counting up from
+	int64_t page_start = 0; // PAGE_START (default 0)
+	string offset_param; // OFFSET_PARAM: how many rows were read before this page, as this query-string parameter
+	// PAGE_SIZE: with PAGE_PARAM or OFFSET_PARAM, a page with fewer rows is the last; without it, only
+	// an empty page is.
+	idx_t page_size = 0;
+	idx_t max_pages = 10000;
+	// COLUMNS: the column list of a tabular response ({"columns": [...], "rows": [[...], ...]}); each
+	// row array becomes an object keyed by those names. An entry is a name or an object with "name".
+	string columns;
+	// COLUMN_TYPES: the output schema, declared instead of inferred: exactly these columns, with
+	// these types, and no request until the scan starts - so a view or PREPARE costs no call.
+	string column_types_json;
+	vector<std::pair<string, LogicalType>> column_types;
+
+	// PAGE_PARAM or OFFSET_PARAM: the next request is worked out by counting, not read from the response.
+	bool Counts() const {
+		return !page_param.empty() || !offset_param.empty();
+	}
+	bool Paginates() const {
+		return !next_url.empty() || !next_token.empty() || Counts();
+	}
+	// True when any option shapes the response, so rows go through the paged reader.
+	bool ShapesResponse() const {
+		return Paginates() || !items.empty() || !columns.empty() || !column_types.empty();
+	}
+	bool operator==(const RestPagination &other) const {
+		return items == other.items && next_url == other.next_url && next_token == other.next_token &&
+		       token_body == other.token_body && token_param == other.token_param && page_param == other.page_param &&
+		       page_start == other.page_start && offset_param == other.offset_param && page_size == other.page_size &&
+		       max_pages == other.max_pages && columns == other.columns && column_types_json == other.column_types_json;
+	}
+};
+
 struct RestFetchInfo : public TableFunctionInfo {
 	string url;
 	string headers_json;
 	string method;
+	RestPagination paging;
 };
 
 // The BIND callback: makes the real HTTP request, parses the JSON response, and works out the

@@ -1,5 +1,7 @@
 #include "json_helpers.hpp"
 
+#include <cmath>
+
 using namespace duckdb_yyjson; // NOLINT - lets us write "yyjson_read(...)" instead of the fully
                                 // qualified "duckdb_yyjson::yyjson_read(...)" everywhere below.
 
@@ -13,9 +15,12 @@ void ParseFlatJsonObject(const string &json, const std::function<void(const stri
 	// yyjson_read() parses the text into an in-memory tree and hands back a "document" handle.
 	// If the text isn't valid JSON at all, it returns a null pointer instead of throwing - so we
 	// check for that ourselves.
-	auto doc = yyjson_read(json.c_str(), json.size(), 0);
+	// Errors describe the problem, never the text: for headers= that text holds credentials.
+	yyjson_read_err error;
+	auto doc = yyjson_read_opts(const_cast<char *>(json.c_str()), json.size(), 0, nullptr, &error);
 	if (!doc) {
-		throw InvalidInputException("rest_ext: failed to parse JSON object: %s", json);
+		throw InvalidInputException("rest_ext: failed to parse a JSON object: %s at byte %llu", error.msg,
+		                            static_cast<unsigned long long>(error.pos));
 	}
 
 	// Every yyjson document has one "root" value. We only accept a JSON object as the root here
@@ -23,7 +28,7 @@ void ParseFlatJsonObject(const string &json, const std::function<void(const stri
 	auto root = yyjson_doc_get_root(doc);
 	if (!root || !yyjson_is_obj(root)) {
 		yyjson_doc_free(doc);
-		throw InvalidInputException("rest_ext: expected a flat JSON object, got: %s", json);
+		throw InvalidInputException("rest_ext: expected a flat JSON object, got a JSON %s", yyjson_get_type_desc(root));
 	}
 
 	// Walk every key/value pair in the object, in the order they appear in the JSON text.
@@ -37,8 +42,13 @@ void ParseFlatJsonObject(const string &json, const std::function<void(const stri
 		string value_str;
 		if (yyjson_is_str(val)) {
 			value_str = string(yyjson_get_str(val), yyjson_get_len(val));
+		} else if (yyjson_is_sint(val)) {
+			value_str = std::to_string(yyjson_get_sint(val));
+		} else if (yyjson_is_uint(val)) {
+			value_str = std::to_string(yyjson_get_uint(val));
 		} else if (yyjson_is_num(val)) {
-			value_str = StringUtil::Format("%g", yyjson_get_num(val));
+			// %.17g round-trips a double; %g would send 20260901.5 as 2.02609e+07.
+			value_str = StringUtil::Format("%.17g", yyjson_get_num(val));
 		} else if (yyjson_is_bool(val)) {
 			value_str = yyjson_get_bool(val) ? "true" : "false";
 		} else {
@@ -188,6 +198,15 @@ static string YyjsonValToRawText(yyjson_val *val) {
 	return result;
 }
 
+// Inference merges every row it sees, so a value can only miss its column's type when the schema
+// was fixed before the value arrived: declared with COLUMN_TYPES, or inferred from an earlier page.
+// Returning NULL there would lose data silently; say which value did not fit instead.
+static Value ThrowDoesNotFit(yyjson_val *val, const LogicalType &type) {
+	throw InvalidInputException("rest_ext: the value %s does not fit the column type %s (declared with "
+	                            "COLUMN_TYPES, or inferred from the first page of the response)",
+	                            YyjsonValToRawText(val), type.ToString());
+}
+
 Value JsonToValue(yyjson_val *val, const LogicalType &type) {
 	if (!val || yyjson_is_null(val)) {
 		// Value(type) with no other arguments constructs a properly-typed SQL NULL.
@@ -195,11 +214,24 @@ Value JsonToValue(yyjson_val *val, const LogicalType &type) {
 	}
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN:
-		return yyjson_is_bool(val) ? Value::BOOLEAN(yyjson_get_bool(val)) : Value(type);
+		if (yyjson_is_bool(val)) {
+			return Value::BOOLEAN(yyjson_get_bool(val));
+		}
+		return ThrowDoesNotFit(val, type);
 	case LogicalTypeId::BIGINT:
-		return yyjson_is_int(val) ? Value::BIGINT(yyjson_get_sint(val)) : Value(type);
+		if (yyjson_is_int(val)) {
+			return Value::BIGINT(yyjson_get_sint(val));
+		}
+		if (yyjson_is_real(val) && std::trunc(yyjson_get_real(val)) == yyjson_get_real(val) &&
+		    std::fabs(yyjson_get_real(val)) < 9.2e18) {
+			return Value::BIGINT(static_cast<int64_t>(yyjson_get_real(val)));
+		}
+		return ThrowDoesNotFit(val, type);
 	case LogicalTypeId::DOUBLE:
-		return yyjson_is_num(val) ? Value::DOUBLE(yyjson_get_num(val)) : Value(type);
+		if (yyjson_is_num(val)) {
+			return Value::DOUBLE(yyjson_get_num(val));
+		}
+		return ThrowDoesNotFit(val, type);
 	case LogicalTypeId::VARCHAR:
 		if (yyjson_is_str(val)) {
 			return Value(string(yyjson_get_str(val), yyjson_get_len(val)));
@@ -210,7 +242,10 @@ Value JsonToValue(yyjson_val *val, const LogicalType &type) {
 	case LogicalTypeId::LIST: {
 		auto &child_type = ListType::GetChildType(type);
 		vector<Value> elements;
-		if (yyjson_is_arr(val)) {
+		if (!yyjson_is_arr(val)) {
+			return ThrowDoesNotFit(val, type);
+		}
+		{
 			size_t idx, max;
 			yyjson_val *elem;
 			yyjson_arr_foreach(val, idx, max, elem) {
@@ -223,6 +258,9 @@ Value JsonToValue(yyjson_val *val, const LogicalType &type) {
 		// Build one Value per field the STRUCT type expects, looking each one up by name in the
 		// JSON object. A field that's missing from this particular JSON value (e.g. an optional
 		// key some rows have and others don't) just becomes NULL.
+		if (!yyjson_is_obj(val)) {
+			return ThrowDoesNotFit(val, type);
+		}
 		child_list_t<Value> struct_values;
 		for (auto &child : StructType::GetChildTypes(type)) {
 			auto &child_name = child.first;

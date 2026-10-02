@@ -21,6 +21,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "rest_fetch_function.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
 
@@ -36,6 +37,7 @@ struct RestResourceConfig {
 	string url;
 	string method;
 	string headers_json;
+	RestPagination paging;
 };
 
 // Builds the Catalog that backs a namespace-mode ATTACH.

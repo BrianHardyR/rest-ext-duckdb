@@ -9,7 +9,8 @@ schema inferred from the JSON response - nested objects become `STRUCT` columns,
 [Choosing an ATTACH mode](#choosing-an-attach-mode) · [Single-endpoint](#single-endpoint-mode) ·
 [Namespace](#namespace-mode-resources) · [OpenAPI import](#openapi-import-mode-format-openapi) ·
 [Calling a resource](#calling-a-resource) · [Response shapes](#response-shape-and-type-inference) ·
-[Authentication](#authentication) · [HTTP semantics](#http-semantics) · [DETACH](#detach) ·
+[Pagination](#pagination) · [Authentication](#authentication) · [HTTP semantics](#http-semantics) ·
+[Locking a database](#locking-a-database) · [DETACH](#detach) ·
 [Limitations](#limitations)
 
 ## How it works
@@ -450,6 +451,66 @@ FROM htmlpage('{}', '{}');
 └─────────────────┴─────────────┘
 ```
 
+## Pagination
+
+Endpoints that return results a page at a time are walked with ATTACH options. Each takes an
+RFC 6901 JSON pointer into one page's response:
+
+| Option | Meaning |
+|---|---|
+| `ITEMS '/data'` | the array of rows in each page (default: the whole response) |
+| `NEXT_URL '/nextLink'` | a full URL for the next page; requested with the same method, headers and body |
+| `NEXT_TOKEN '/cursor'` | an opaque cursor for the next page, sent back through one of: |
+| `TOKEN_BODY '/options/cursor'` | ...written into the request body at this pointer |
+| `TOKEN_PARAM 'cursor'` | ...added as this query-string parameter |
+| `PAGE_PARAM 'page[number]'` | a page number, sent as this query-string parameter and counted up by one per page... |
+| `PAGE_START 1` | ...from this number (default 0) |
+| `OFFSET_PARAM 'start'` | how many rows were read before this page, sent as this query-string parameter |
+| `PAGE_SIZE 1000` | with `PAGE_PARAM` or `OFFSET_PARAM`: a page with fewer rows than this is the last one; without it, only an empty page is |
+| `MAX_PAGES 10000` | stop with an error after this many requests (default 10000) |
+| `COLUMNS '/columns'` | for a tabular response (`{"columns": [...], "rows": [[...], ...]}`): name each row array's values after this column list, whose entries are names or objects with a `"name"` |
+| `COLUMN_TYPES '{"Cost":"DOUBLE"}'` | declare a column's type (`VARCHAR`, `BIGINT`, `DOUBLE`, `BOOLEAN`, or a `LIST` or `STRUCT` of those) instead of inferring it; declared columns are present even when there are no rows |
+
+These options also work on an endpoint that doesn't paginate. Set one of `NEXT_URL`, `NEXT_TOKEN`,
+`PAGE_PARAM` and `OFFSET_PARAM`: they are four ways of asking for the next page.
+
+Paging stops when the cursor is missing, null or empty, or - for `PAGE_PARAM` and `OFFSET_PARAM`,
+which have no cursor to read - when a page is empty or shorter than `PAGE_SIZE`. The page size
+itself is an ordinary query parameter the caller sends (`'{"count":"1000"}'`); `PAGE_SIZE` only
+tells rest_ext what a full page is, so it can stop without asking for an empty one.
+
+The scan streams: the column schema is inferred from the first page that has rows, later pages are
+fetched only as the query reaches them (so `LIMIT 10` makes one request, not a hundred), and a row
+on a later page that doesn't fit that schema is an error rather than a silent `NULL` - declare a
+column with `COLUMN_TYPES` when a first page could mislead inference (a cost of `0` infers
+`BIGINT`; `1.25` on page two then fails). An interrupted query stops between pages.
+
+```sql
+-- A next-page link (Azure Cost Management):
+ATTACH 'url=https://management.azure.com/subscriptions/<id>/providers/Microsoft.CostManagement/query?api-version=2023-11-01 method=POST headers={"Authorization":"Bearer <token>"}'
+    AS costs (TYPE rest_ext, ITEMS '/properties/rows', COLUMNS '/properties/columns',
+              NEXT_URL '/properties/nextLink', COLUMN_TYPES '{"Cost":"DOUBLE"}');
+
+-- A cursor in the body (Azure Resource Graph):
+ATTACH 'url=https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01 method=POST headers={"Authorization":"Bearer <token>"}'
+    AS graph (TYPE rest_ext, ITEMS '/data', NEXT_TOKEN '/$skipToken', TOKEN_BODY '/options/$skipToken');
+```
+
+```sql
+-- An offset (Datadog's host list, 1000 hosts a page):
+ATTACH 'url=https://api.datadoghq.com/api/v1/hosts method=GET headers={"DD-API-KEY":"<key>","DD-APPLICATION-KEY":"<key>"}'
+    AS hosts (TYPE rest_ext, ITEMS '/host_list', OFFSET_PARAM 'start', PAGE_SIZE 1000);
+SELECT host_name FROM hosts('{"count":"1000"}', '{}');
+
+-- A page number counted from 0 (Datadog's users):
+ATTACH 'url=https://api.datadoghq.com/api/v2/users method=GET headers={...}'
+    AS users (TYPE rest_ext, ITEMS '/data', PAGE_PARAM 'page[number]', PAGE_SIZE 100);
+SELECT id, attributes.email FROM users('{"page[size]":"100"}', '{}');
+```
+
+A `NEXT_URL` is only followed on the endpoint's own origin (scheme, host and port), so a response
+can't redirect the request's headers - its credentials - to another host.
+
 ## Authentication
 
 Headers (API keys, bearer tokens, etc.) can be passed inline, or stored once as a secret and
@@ -473,7 +534,10 @@ resolved headers for a request to https://api.example.com/...
 - `rest_ext_headers` is a generic header bag - not tied to any one auth scheme, so it works
   equally well for a bearer token, an API key header, pre-encoded Basic auth, or anything else a
   REST API wants in its headers.
-- `SCOPE` matching is longest-prefix, the same mechanism DuckDB's built-in `http`/S3 secrets use.
+- `SCOPE` matching is longest-prefix, but only up to a URL boundary: a scope matches the URL itself,
+  or a prefix of it followed by `/`, `?` or `#` (or a scope ending in `/`). So a scope of
+  `https://api.example.com` applies to `https://api.example.com/v1/x` but not to
+  `https://api.example.com.evil.net` or `https://api.example.com:8443`.
 - Header values are marked sensitive: `duckdb_secrets()` shows `headers=redacted`, never the real
   values.
 - Resolved once, at `ATTACH` time, independently **per resource URL** - a namespace or OpenAPI
@@ -511,9 +575,25 @@ FROM secretapi('{}', '{}');
 | Connect timeout | 10s |
 | Read timeout | 30s |
 | Write timeout | 30s |
-| Redirects | followed automatically |
+| Redirects | followed on the same origin only (up to 5); a redirect to another origin is an error, so headers are never forwarded to another host |
+| Headers | a name must be an HTTP token and a value may not contain a control character (CR/LF would inject headers) |
+| Path `{placeholders}` | values are percent-encoded (`/` kept); a `..` segment is refused; a placeholder in the host may only hold letters, digits, `-` and `.` |
 | Non-2xx status | raises `IOException`, including the response status/body |
 | Network failure | raises `IOException` with the underlying error (DNS, TLS, connection refused, timeout, ...) |
+
+## Locking a database
+
+With `enable_external_access = false`, `ATTACH ... (TYPE rest_ext)` is refused, while endpoints
+attached before the setting was turned off keep working. A host can attach the endpoints it allows,
+then lock the database so the SQL it runs can't reach anywhere else:
+
+```sql
+ATTACH 'url=https://api.example.com/v1/items' AS items (TYPE rest_ext);
+SET enable_external_access = false;
+SET lock_configuration = true;
+SELECT * FROM items('{}', '{}');                               -- works
+ATTACH 'url=https://elsewhere.example' AS x (TYPE rest_ext);  -- Permission Error
+```
 
 ## DETACH
 
@@ -528,12 +608,10 @@ FROM secretapi('{}', '{}');
 
 - OpenAPI (2.0/3.x) is the only supported spec format - convert other formats (e.g. Postman) to
   OpenAPI first.
-- One HTTP call per table-function invocation, so no built-in pagination: all output rows come from
-  that single response. An API that returns results a page at a time (e.g. a
-  `next_cursor`/`next_page_token` field, or a `Link` header) only gets you that one page per call -
-  `rest_ext` doesn't follow cursors or walk subsequent pages automatically. Paging through results
-  means issuing repeat calls yourself, feeding each response's cursor value back in as the next
-  call's query param (e.g. via a recursive CTE, or a loop in whatever's driving the SQL).
+- Pagination (see [Pagination](#pagination)) follows a cursor or next-page link in the JSON body;
+  a `Link` response header isn't read. The pagination options don't apply to `FORMAT 'openapi'`.
+- A single request can block for up to the read timeout (30s); an interrupt takes effect between
+  pages, not inside one request.
 - OpenAPI security schemes aren't parsed - configure auth via `CREATE SECRET`/`headers=` instead.
 - Namespace mode's hand-written `resources={...}` gives every resource the same HTTP method; use
   OpenAPI import if you need a mix of GET/POST/etc. under one alias.

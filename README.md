@@ -20,6 +20,9 @@ LOAD rest_ext;
 binary is unsigned, so DuckDB also needs to be started with `duckdb -unsigned` (or
 `allow_unsigned_extensions=true` at connection time).
 
+The v1.5.5 `linux_amd64` binary is built on Debian bookworm by `scripts/build-linux-amd64.sh` and
+needs glibc 2.34 or newer (Debian 12, Ubuntu 22.04 and later).
+
 Other platforms, or a DuckDB version outside that range - build from source:
 
 ```sh
