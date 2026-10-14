@@ -29,6 +29,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "http_client.hpp"
 #include "duckdb/function/table_function.hpp"
 
 namespace duckdb {
@@ -44,6 +45,7 @@ namespace duckdb {
 struct RestPagination {
 	string items;        // ITEMS: the array of rows in a page; empty = the whole response
 	string next_url;     // NEXT_URL: an absolute URL for the next page, same origin only
+	bool next_link_header = false; // NEXT_LINK_HEADER: the next page is the Link header's rel="next", same origin only
 	string next_token;   // NEXT_TOKEN: an opaque cursor for the next page...
 	string token_body;   // TOKEN_BODY: ...written into the request body at this pointer, or
 	string token_param;  // TOKEN_PARAM: ...sent as this query-string parameter
@@ -67,14 +69,14 @@ struct RestPagination {
 		return !page_param.empty() || !offset_param.empty();
 	}
 	bool Paginates() const {
-		return !next_url.empty() || !next_token.empty() || Counts();
+		return !next_url.empty() || next_link_header || !next_token.empty() || Counts();
 	}
 	// True when any option shapes the response, so rows go through the paged reader.
 	bool ShapesResponse() const {
 		return Paginates() || !items.empty() || !columns.empty() || !column_types.empty();
 	}
 	bool operator==(const RestPagination &other) const {
-		return items == other.items && next_url == other.next_url && next_token == other.next_token &&
+		return items == other.items && next_url == other.next_url && next_link_header == other.next_link_header && next_token == other.next_token &&
 		       token_body == other.token_body && token_param == other.token_param && page_param == other.page_param &&
 		       page_start == other.page_start && offset_param == other.offset_param && page_size == other.page_size &&
 		       max_pages == other.max_pages && columns == other.columns && column_types_json == other.column_types_json;
@@ -86,6 +88,7 @@ struct RestFetchInfo : public TableFunctionInfo {
 	string headers_json;
 	string method;
 	RestPagination paging;
+	RestCallOptions call;
 };
 
 // The BIND callback: makes the real HTTP request, parses the JSON response, and works out the

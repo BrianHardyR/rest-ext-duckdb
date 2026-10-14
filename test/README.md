@@ -9,3 +9,8 @@ or
 ```bash
 make test_debug
 ```
+
+`test/sql/rest_ext_calls.test` (retries, bounds, `Link` paging, `rest_ext_calls()`) talks to the local
+HTTP server in `test/fixtures/fixture_server.py` and is skipped unless `REST_EXT_FIXTURE_URL` is set.
+`test/run_fixture_tests.sh` starts the server, sets that variable and runs the test with the built
+`unittest` binary (`UNITTEST=...` to use another).

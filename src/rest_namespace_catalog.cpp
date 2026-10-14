@@ -55,6 +55,7 @@ public:
 			fetch_info->headers_json = resource.headers_json;
 			fetch_info->method = resource.method;
 			fetch_info->paging = resource.paging;
+			fetch_info->call = resource.call;
 
 			// Build a TableFunction named after this resource (e.g. "Projects"), wired up to the
 			// SAME bind/execute callbacks every other REST call in this extension uses.

@@ -7,6 +7,7 @@
 //   rest_attachment_catalog.{hpp,cpp} - single-endpoint ATTACH mode (bare `myapi(...)` calls)
 //   rest_namespace_catalog.{hpp,cpp}  - namespace ATTACH mode (dot-qualified `gcp.Foo(...)` calls)
 //   rest_fetch_function.{hpp,cpp}     - the actual bind/execute logic behind every REST call
+//   rest_call_log.{hpp,cpp}           - the rest_ext_calls() ring of recent HTTP calls
 //   rest_secrets.{hpp,cpp}            - CREATE SECRET support for header/credential values
 //   http_client.{hpp,cpp}             - the low-level HTTP request/response code
 //   json_helpers.{hpp,cpp}            - JSON <-> DuckDB type/value conversions
@@ -15,12 +16,14 @@
 #include "rest_ext_extension.hpp"
 
 #include "rest_attach.hpp"
+#include "rest_call_log.hpp"
 #include "rest_secrets.hpp"
 
 namespace duckdb {
 
 #ifdef REST_EXT_HAS_EXTENSION_LOADER
 static void LoadInternal(ExtensionLoader &loader) {
+	RegisterRestCallLog(loader);
 	RegisterRestExtStorageExtension(loader.GetDatabaseInstance());
 	RegisterRestExtHeadersSecretType(loader);
 }
@@ -30,6 +33,7 @@ void RestExtExtension::Load(ExtensionLoader &loader) {
 }
 #else
 static void LoadInternal(DatabaseInstance &db) {
+	RegisterRestCallLog(db);
 	RegisterRestExtStorageExtension(db);
 	RegisterRestExtHeadersSecretType(db);
 }
