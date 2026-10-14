@@ -38,6 +38,7 @@ struct RestResourceConfig {
 	string method;
 	string headers_json;
 	RestPagination paging;
+	RestCallOptions call;
 };
 
 // Builds the Catalog that backs a namespace-mode ATTACH.

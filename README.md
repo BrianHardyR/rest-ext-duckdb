@@ -76,6 +76,11 @@ CREATE SECRET (
 );
 ```
 
+Rate limits and flaky APIs: `RETRIES`, `TIMEOUT_MS`, `MAX_BYTES`, `MAX_ROWS` and friends are opt-in
+`ATTACH` options, and `SELECT * FROM rest_ext_calls()` lists the last 500 HTTP calls (endpoint, status,
+latency, retries, `Retry-After`, rate-limit headers) for troubleshooting - see
+[Retries, bounds and call diagnostics](USAGE.md#retries-bounds-and-call-diagnostics).
+
 See [USAGE.md](USAGE.md) for the full walkthrough, and `test/sql/rest_ext.test` /
 `test/sql/rest_ext_openapi_live.test_slow` for more worked examples.
 
@@ -90,11 +95,9 @@ See [USAGE.md](USAGE.md) for the full walkthrough, and `test/sql/rest_ext.test` 
 
 - OpenAPI (2.0/3.x) is the only supported spec format - convert other formats (e.g. Postman) to
   OpenAPI first.
-- One HTTP call per table-function invocation, so no built-in pagination: an API that returns
-  results a page at a time (e.g. a `next_cursor`/`next_page_token` field, or a `Link` header) only
-  gets you that one page per call - `rest_ext` doesn't follow cursors or walk subsequent pages
-  automatically. Paging through results means issuing repeat calls yourself (e.g. a recursive CTE
-  or a loop in application code) with each page's cursor value passed back in as a query param.
+- Paging is opt-in, per `ATTACH`: `NEXT_URL`, `NEXT_LINK_HEADER` (the `Link` header), `NEXT_TOKEN`,
+  `PAGE_PARAM` and `OFFSET_PARAM` walk the pages of one endpoint (see [USAGE.md](USAGE.md#pagination)).
+  Without one of them a call makes exactly one request and returns that one page.
 - OpenAPI security schemes aren't parsed - configure auth via `CREATE SECRET`/`headers=` instead.
 - Namespace mode's hand-written `resources={...}` gives every resource the same HTTP method; use
   OpenAPI import for a mix of GET/POST/etc.
@@ -111,6 +114,7 @@ Built on the [DuckDB extension template](https://github.com/duckdb/extension-tem
 ```sh
 make          # build ./build/release/duckdb with the extension loaded
 make test     # run the SQL tests in test/sql
+test/run_fixture_tests.sh   # the retry / bounds / rest_ext_calls() tests, against test/fixtures/fixture_server.py
 ```
 
 Submodules: `duckdb` (core, pinned to v1.5.5) and `extension-ci-tools` (build/test/deploy

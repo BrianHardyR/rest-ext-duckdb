@@ -103,6 +103,7 @@ set(EXTENSION_SOURCES
     src/rest_ext_extension.cpp
     src/rest_attach.cpp
     src/rest_attachment_catalog.cpp
+    src/rest_call_log.cpp
     src/rest_namespace_catalog.cpp
     src/rest_fetch_function.cpp
     src/rest_secrets.cpp

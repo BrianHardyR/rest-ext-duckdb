@@ -22,6 +22,9 @@ struct RestPage {
 	// another page may follow it (it had rows, and as many as PAGE_SIZE when that is set).
 	int64_t position = 0;
 	bool more = false;
+	// The id of the HTTP call that produced this page in the RestCallLog, to attach its row count
+	// and any bound it hit.
+	uint64_t call_id = 0;
 
 	bool HasNext() const {
 		return !next_url.empty() || !next_token.empty() || more;
@@ -125,43 +128,53 @@ static void NameTabularRows(RestPage &page, yyjson_val *root, const string &colu
 }
 
 // Fetches one page. `previous` is the page before it, or nullptr for the first request.
-static RestPage FetchPage(const RestFetchInfo &info, const string &query_params_json, const string &body_json,
-                          const RestPage *previous) {
+static RestPage FetchPage(ClientContext &context, const RestFetchInfo &info, const string &query_params_json,
+                          const string &body_json, const RestPage *previous, idx_t page_index) {
 	auto &paging = info.paging;
-	string response_body;
+	auto &call = info.call;
+	RestCallTrace trace;
+	trace.context = &context;
+	trace.page_index = page_index;
+	RestResponse response;
 	int64_t position = 0;
 	if (paging.Counts()) {
 		// A page number counts up by one from PAGE_START; an offset by the rows already read.
 		auto by_page = !paging.page_param.empty();
 		position = !previous ? (by_page ? paging.page_start : 0)
 		                     : previous->position + (by_page ? 1 : static_cast<int64_t>(previous->rows.size()));
-		response_body = PerformRestCall(
+		response = PerformRestCall(
 		    info.url, info.method, info.headers_json,
 		    QueryWithToken(query_params_json, by_page ? paging.page_param : paging.offset_param, std::to_string(position)),
-		    body_json);
+		    body_json, call, trace);
 	} else if (!previous) {
-		response_body = PerformRestCall(info.url, info.method, info.headers_json, query_params_json, body_json);
+		response = PerformRestCall(info.url, info.method, info.headers_json, query_params_json, body_json, call, trace);
 	} else if (!previous->next_url.empty()) {
 		// A next-page link from the response is only followed on the endpoint's own origin, so a
 		// response can't send the request's headers (its credentials) anywhere else.
 		if (RestUrlOrigin(previous->next_url) != RestUrlOrigin(info.url)) {
-			throw IOException("rest_ext: NEXT_URL \"%s\" is not on the endpoint's origin; not following it",
-			                  previous->next_url);
+			throw IOException("rest_ext: %s \"%s\" is not on the endpoint's origin; not following it",
+			                  paging.next_link_header ? "the Link header's next URL" : "NEXT_URL", previous->next_url);
 		}
-		response_body = PerformRestCallToUrl(previous->next_url, info.method, info.headers_json, body_json);
+		trace.endpoint = RestEndpointLabel(info.url);
+		response = PerformRestCallToUrl(previous->next_url, info.method, info.headers_json, body_json, call, trace);
 	} else if (!paging.token_body.empty()) {
-		response_body = PerformRestCall(info.url, info.method, info.headers_json, query_params_json,
-		                                BodyWithToken(body_json, paging.token_body, previous->next_token));
+		response = PerformRestCall(info.url, info.method, info.headers_json, query_params_json,
+		                           BodyWithToken(body_json, paging.token_body, previous->next_token), call, trace);
 	} else {
-		response_body =
-		    PerformRestCall(info.url, info.method, info.headers_json,
-		                    QueryWithToken(query_params_json, paging.token_param, previous->next_token), body_json);
+		response = PerformRestCall(info.url, info.method, info.headers_json,
+		                           QueryWithToken(query_params_json, paging.token_param, previous->next_token),
+		                           body_json, call, trace);
 	}
 
 	RestPage page;
+	page.call_id = response.call_id;
+	auto &response_body = response.body;
 	page.doc = shared_ptr<yyjson_doc>(yyjson_read(response_body.c_str(), response_body.size(), 0), yyjson_doc_free);
 	auto root = page.doc ? yyjson_doc_get_root(page.doc.get()) : nullptr;
 	if (!root) {
+		if (call.log) {
+			call.log->SetOutcome(page.call_id, "invalid_body", "the response is not JSON");
+		}
 		throw IOException("rest_ext: a paginated endpoint returned a response that is not JSON");
 	}
 	auto items = ResolvePointer(root, paging.items);
@@ -176,6 +189,8 @@ static RestPage FetchPage(const RestFetchInfo &info, const string &query_params_
 	}
 	if (!paging.next_url.empty()) {
 		page.next_url = CursorText(ResolvePointer(root, paging.next_url), "NEXT_URL");
+	} else if (paging.next_link_header) {
+		page.next_url = RestNextLinkTarget(response.link_header, response.url);
 	} else if (!paging.next_token.empty()) {
 		page.next_token = CursorText(ResolvePointer(root, paging.next_token), "NEXT_TOKEN");
 	} else if (paging.Counts()) {
@@ -186,11 +201,21 @@ static RestPage FetchPage(const RestFetchInfo &info, const string &query_params_
 		// Last: this replaces page.doc, which `root` points into.
 		NameTabularRows(page, root, paging.columns);
 	}
+	if (call.log) {
+		call.log->SetRows(page.call_id, NumericCast<int64_t>(page.rows.size()));
+	}
 	if (!paging.Counts() && previous && page.HasNext() && page.next_url == previous->next_url &&
 	    page.next_token == previous->next_token) {
 		throw IOException("rest_ext: the API returned the same next-page cursor twice; stopping");
 	}
 	return page;
+}
+
+[[noreturn]] static void StopAtMaxPages(const RestCallOptions &call, const RestPage &last, idx_t max_pages) {
+	if (call.log) {
+		call.log->SetOutcome(last.call_id, "bound_hit", "stopped after MAX_PAGES");
+	}
+	throw IOException("rest_ext: stopped after MAX_PAGES (%llu) pages", max_pages);
 }
 
 static LogicalType InferRowType(const vector<yyjson_val *> &rows) {
@@ -264,7 +289,8 @@ struct RestFetchBindData : public FunctionData {
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<RestFetchBindData>();
 		return url == other.url && method == other.method && headers_json == other.headers_json &&
-		       query_params_json == other.query_params_json && body_json == other.body_json && paging == other.paging;
+		       query_params_json == other.query_params_json && body_json == other.body_json && paging == other.paging &&
+		       request.call == other.request.call;
 	}
 };
 
@@ -290,16 +316,21 @@ unique_ptr<FunctionData> RestFetchBind(ClientContext &context, TableFunctionBind
 	result->request.headers_json = info.headers_json;
 	result->request.method = info.method;
 	result->request.paging = info.paging;
+	result->request.call = info.call;
 
 	LogicalType inferred;
 	if (!info.paging.ShapesResponse()) {
 		// This is the actual network call - see http_client.hpp. We do it HERE, in bind,
 		// specifically so we can look at the real response and decide the output schema before
 		// DuckDB needs it.
-		auto response_body = PerformRestCall(result->url, result->method, result->headers_json,
-		                                     result->query_params_json, result->body_json);
+		RestCallTrace trace;
+		trace.context = &context;
+		auto response = PerformRestCall(result->url, result->method, result->headers_json, result->query_params_json,
+		                                result->body_json, info.call, trace);
+		auto response_body = std::move(response.body);
 		result->pages_fetched = 1;
 		auto &page = result->first_page;
+		page.call_id = response.call_id;
 		page.doc =
 		    shared_ptr<yyjson_doc>(yyjson_read(response_body.c_str(), response_body.size(), 0), yyjson_doc_free);
 		auto root = page.doc ? yyjson_doc_get_root(page.doc.get()) : nullptr;
@@ -309,6 +340,9 @@ unique_ptr<FunctionData> RestFetchBind(ClientContext &context, TableFunctionBind
 			// erroring, since not every REST endpoint returns JSON.
 			result->is_raw_text = true;
 			result->raw_text = std::move(response_body);
+			if (info.call.log) {
+				info.call.log->SetRows(page.call_id, 1);
+			}
 			names.push_back("result");
 			return_types.push_back(LogicalType::VARCHAR);
 			return std::move(result);
@@ -326,6 +360,9 @@ unique_ptr<FunctionData> RestFetchBind(ClientContext &context, TableFunctionBind
 			// A single JSON value (usually an object) - our one and only output row.
 			page.rows.push_back(root);
 		}
+		if (info.call.log) {
+			info.call.log->SetRows(page.call_id, NumericCast<int64_t>(page.rows.size()));
+		}
 		inferred = InferRowType(page.rows);
 	} else if (!info.paging.column_types.empty()) {
 		// A declared schema needs no response to bind, so the first page waits for the scan.
@@ -336,16 +373,17 @@ unique_ptr<FunctionData> RestFetchBind(ClientContext &context, TableFunctionBind
 		// A paginated endpoint streams: the schema comes from the first page that has rows, and
 		// later pages are fetched only as the scan reaches them (so LIMIT stops early and memory
 		// holds one page). A later row that doesn't fit that schema is an error, not a NULL.
-		result->first_page = FetchPage(info, result->query_params_json, result->body_json, nullptr);
+		result->first_page = FetchPage(context, info, result->query_params_json, result->body_json, nullptr, 0);
 		result->pages_fetched = 1;
 		while (result->first_page.rows.empty() && result->first_page.HasNext()) {
 			if (result->pages_fetched >= info.paging.max_pages) {
-				throw IOException("rest_ext: stopped after MAX_PAGES (%llu) pages", info.paging.max_pages);
+				StopAtMaxPages(info.call, result->first_page, info.paging.max_pages);
 			}
 			if (context.interrupted) {
 				throw InterruptException();
 			}
-			auto next = FetchPage(info, result->query_params_json, result->body_json, &result->first_page);
+			auto next = FetchPage(context, info, result->query_params_json, result->body_json, &result->first_page,
+			                      result->pages_fetched);
 			result->first_page = std::move(next);
 			result->pages_fetched++;
 		}
@@ -379,6 +417,7 @@ struct RestFetchGlobalState : public GlobalTableFunctionState {
 	RestPage page;
 	idx_t row_idx = 0;
 	idx_t pages_fetched = 0;
+	idx_t rows_emitted = 0;
 	bool raw_text_done = false;
 };
 
@@ -386,7 +425,7 @@ unique_ptr<GlobalTableFunctionState> RestFetchInitGlobal(ClientContext &context,
 	auto &bind = input.bind_data->Cast<RestFetchBindData>();
 	auto state = make_uniq<RestFetchGlobalState>();
 	if (bind.first_page_deferred) {
-		state->page = FetchPage(bind.request, bind.query_params_json, bind.body_json, nullptr);
+		state->page = FetchPage(context, bind.request, bind.query_params_json, bind.body_json, nullptr, 0);
 		state->pages_fetched = 1;
 	} else {
 		state->page = bind.first_page;
@@ -399,12 +438,13 @@ unique_ptr<GlobalTableFunctionState> RestFetchInitGlobal(ClientContext &context,
 static bool AdvancePage(ClientContext &context, const RestFetchBindData &bind, RestFetchGlobalState &state) {
 	while (state.page.HasNext()) {
 		if (state.pages_fetched >= bind.paging.max_pages) {
-			throw IOException("rest_ext: stopped after MAX_PAGES (%llu) pages", bind.paging.max_pages);
+			StopAtMaxPages(bind.request.call, state.page, bind.paging.max_pages);
 		}
 		if (context.interrupted) {
 			throw InterruptException();
 		}
-		auto next = FetchPage(bind.request, bind.query_params_json, bind.body_json, &state.page);
+		auto next = FetchPage(context, bind.request, bind.query_params_json, bind.body_json, &state.page,
+		                      state.pages_fetched);
 		state.page = std::move(next);
 		state.row_idx = 0;
 		state.pages_fetched++;
@@ -436,7 +476,17 @@ void RestFetchFunction(ClientContext &context, TableFunctionInput &data, DataChu
 	idx_t count = 0;
 	// Hand back up to STANDARD_VECTOR_SIZE rows this call; DuckDB will call us again for more if
 	// there are any left, and we'll pick up where `state.row_idx` left off.
+	auto &call = bind.request.call;
 	while (count < STANDARD_VECTOR_SIZE) {
+		if (call.max_rows > 0 && state.rows_emitted >= static_cast<idx_t>(call.max_rows)) {
+			// MAX_ROWS reached: this is a stop, not an error. Note it on the call that supplied the
+			// last row when the API may have had more.
+			if (call.log && (state.row_idx < state.page.rows.size() || state.page.HasNext())) {
+				call.log->SetOutcome(state.page.call_id, "bound_hit",
+				                     "stopped at MAX_ROWS (" + std::to_string(call.max_rows) + ")");
+			}
+			break;
+		}
 		if (state.row_idx >= state.page.rows.size()) {
 			if (count > 0 || !AdvancePage(context, bind, state)) {
 				break;
@@ -456,6 +506,7 @@ void RestFetchFunction(ClientContext &context, TableFunctionInput &data, DataChu
 			}
 		}
 		state.row_idx++;
+		state.rows_emitted++;
 		count++;
 	}
 	output.SetCardinality(count);

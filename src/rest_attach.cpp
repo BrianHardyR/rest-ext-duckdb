@@ -3,6 +3,7 @@
 #include "http_client.hpp"
 #include "json_helpers.hpp"
 #include "rest_attachment_catalog.hpp"
+#include "rest_call_log.hpp"
 #include "rest_fetch_function.hpp"
 #include "rest_namespace_catalog.hpp"
 #include "rest_secrets.hpp"
@@ -19,6 +20,8 @@
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 
 #include <algorithm>
+
+using namespace duckdb_yyjson; // NOLINT
 
 namespace duckdb {
 
@@ -165,27 +168,105 @@ static bool IsJsonReadableType(const LogicalType &type) {
 	}
 }
 
+static std::pair<bool, int64_t> ReadIntegerOption(RestAttachOptionSource &options, const string &key,
+                                                  int64_t minimum, int64_t maximum = NumericLimits<int64_t>::Maximum()) {
+	auto text = TakeAttachOptionCI(options, key);
+	if (text.empty()) {
+		return {false, 0};
+	}
+	int64_t parsed = 0;
+	if (!TryCast::Operation<string_t, int64_t>(string_t(text), parsed) || parsed < minimum || parsed > maximum) {
+		throw BinderException("rest_ext: %s must be an integer of at least %lld%s (got \"%s\")", StringUtil::Upper(key),
+		                      static_cast<long long>(minimum),
+		                      maximum == NumericLimits<int64_t>::Maximum()
+		                          ? string()
+		                          : " and at most " + std::to_string(maximum),
+		                      text);
+	}
+	return {true, parsed};
+}
+
+static bool ReadBooleanOption(RestAttachOptionSource &options, const string &key) {
+	auto text = TakeAttachOptionCI(options, key);
+	if (text.empty()) {
+		return false;
+	}
+	auto lowered = StringUtil::Lower(text);
+	if (lowered == "true" || lowered == "1") {
+		return true;
+	}
+	if (lowered == "false" || lowered == "0") {
+		return false;
+	}
+	throw BinderException("rest_ext: %s must be true or false (got \"%s\")", StringUtil::Upper(key), text);
+}
+
+// RETRIES, RETRY_BACKOFF_MS, RETRY_CAP_MS, TIMEOUT_MS, MAX_BYTES, MAX_ROWS, RATE_LIMIT_HEADERS and
+// USER_AGENT: how each call is made and recorded. Every default leaves a call as it was without them.
+static RestCallOptions ReadCallOptions(ClientContext &context, RestAttachOptionSource &options, const string &alias) {
+	RestCallOptions call;
+	call.alias = alias;
+	call.log = FindRestCallLog(context);
+	auto retries = ReadIntegerOption(options, "retries", 0, 20);
+	call.retries = static_cast<idx_t>(retries.second);
+	auto backoff = ReadIntegerOption(options, "retry_backoff_ms", 1);
+	auto cap = ReadIntegerOption(options, "retry_cap_ms", 1);
+	if (backoff.first) {
+		call.retry_backoff_ms = backoff.second;
+	}
+	if (cap.first) {
+		call.retry_cap_ms = cap.second;
+	}
+	if (call.retry_cap_ms < call.retry_backoff_ms) {
+		throw BinderException("rest_ext: RETRY_CAP_MS (%lld) must be at least RETRY_BACKOFF_MS (%lld)",
+		                      static_cast<long long>(call.retry_cap_ms), static_cast<long long>(call.retry_backoff_ms));
+	}
+	call.timeout_ms = ReadIntegerOption(options, "timeout_ms", 1).second;
+	call.max_bytes = ReadIntegerOption(options, "max_bytes", 1).second;
+	call.max_rows = ReadIntegerOption(options, "max_rows", 1).second;
+
+	auto names_json = TakeAttachOptionCI(options, "rate_limit_headers");
+	if (!names_json.empty()) {
+		auto doc = shared_ptr<yyjson_doc>(yyjson_read(names_json.c_str(), names_json.size(), 0), yyjson_doc_free);
+		auto root = doc ? yyjson_doc_get_root(doc.get()) : nullptr;
+		if (!root || !yyjson_is_arr(root)) {
+			throw BinderException("rest_ext: RATE_LIMIT_HEADERS must be a JSON array of header names, e.g. "
+			                      "'[\"x-ratelimit-remaining\",\"ratelimit-limit\"]'");
+		}
+		size_t idx, max;
+		yyjson_val *name;
+		yyjson_arr_foreach(root, idx, max, name) {
+			if (!yyjson_is_str(name) || yyjson_get_len(name) == 0) {
+				throw BinderException("rest_ext: RATE_LIMIT_HEADERS must be a JSON array of header names");
+			}
+			call.rate_limit_headers.emplace_back(yyjson_get_str(name), yyjson_get_len(name));
+		}
+		call.rate_limit_headers_set = true;
+	}
+
+	auto user_agent = TakeAttachOptionCI(options, "user_agent");
+	if (!user_agent.empty()) {
+		for (auto c : user_agent) {
+			if ((static_cast<unsigned char>(c) < 0x20 && c != '\t') || static_cast<unsigned char>(c) == 0x7F) {
+				throw BinderException("rest_ext: USER_AGENT contains a control character");
+			}
+		}
+		call.user_agent = user_agent;
+	}
+	return call;
+}
+
 static RestPagination ReadPagination(ClientContext &context, RestAttachOptionSource &options) {
 	RestPagination paging;
 	paging.items = ReadPointerOption(options, "items");
 	paging.next_url = ReadPointerOption(options, "next_url");
+	paging.next_link_header = ReadBooleanOption(options, "next_link_header");
 	paging.next_token = ReadPointerOption(options, "next_token");
 	paging.token_body = ReadPointerOption(options, "token_body");
 	paging.token_param = TakeAttachOptionCI(options, "token_param");
 	paging.page_param = TakeAttachOptionCI(options, "page_param");
 	paging.offset_param = TakeAttachOptionCI(options, "offset_param");
-	auto integer_option = [&](const string &key, int64_t minimum) -> std::pair<bool, int64_t> {
-		auto text = TakeAttachOptionCI(options, key);
-		if (text.empty()) {
-			return {false, 0};
-		}
-		int64_t parsed = 0;
-		if (!TryCast::Operation<string_t, int64_t>(string_t(text), parsed) || parsed < minimum) {
-			throw BinderException("rest_ext: %s must be an integer of at least %lld (got \"%s\")", StringUtil::Upper(key),
-			                      static_cast<long long>(minimum), text);
-		}
-		return {true, parsed};
-	};
+	auto integer_option = [&](const string &key, int64_t minimum) { return ReadIntegerOption(options, key, minimum); };
 	auto max_pages = integer_option("max_pages", 1);
 	if (max_pages.first) {
 		paging.max_pages = static_cast<idx_t>(max_pages.second);
@@ -207,10 +288,11 @@ static RestPagination ReadPagination(ClientContext &context, RestAttachOptionSou
 			paging.column_types.emplace_back(name, type);
 		});
 	}
-	auto styles = (paging.next_url.empty() ? 0 : 1) + (paging.next_token.empty() ? 0 : 1) +
+	auto styles = (paging.next_url.empty() ? 0 : 1) + (paging.next_link_header ? 1 : 0) + (paging.next_token.empty() ? 0 : 1) +
 	              (paging.page_param.empty() ? 0 : 1) + (paging.offset_param.empty() ? 0 : 1);
 	if (styles > 1) {
-		throw BinderException("rest_ext: set one of NEXT_URL, NEXT_TOKEN, PAGE_PARAM and OFFSET_PARAM, not several");
+		throw BinderException("rest_ext: set one of NEXT_URL, NEXT_TOKEN, PAGE_PARAM and OFFSET_PARAM, not several "
+		                      "(NEXT_LINK_HEADER is one of these paging styles too)");
 	}
 	if (page_start.first && paging.page_param.empty()) {
 		throw BinderException("rest_ext: PAGE_START only applies with PAGE_PARAM");
@@ -268,6 +350,7 @@ static unique_ptr<Catalog> RestAttach(StorageExtensionInfo *storage_info, Client
 	//     since (see ReadSpecFile's comment) a URL can never go directly in the ATTACH path.
 	//   - otherwise, the ATTACH path itself, treated as a local file path.
 	auto paging = ReadPagination(context, attach_options);
+	auto call = ReadCallOptions(context, attach_options, name);
 
 	auto format_option = FindAttachOptionCI(attach_options, "format");
 	if (!format_option.empty()) {
@@ -284,7 +367,7 @@ static unique_ptr<Catalog> RestAttach(StorageExtensionInfo *storage_info, Client
 		string spec_origin; // "scheme://host[:port]" the spec was fetched from, if known - used to
 		                    // resolve a RELATIVE "servers" URL (see ParseOpenApiSpec's header comment)
 		if (!spec_url.empty()) {
-			spec_document = PerformRestCall(spec_url, "GET", "{}", "{}", "{}");
+			spec_document = PerformRestCall(spec_url, "GET", "{}", "{}", "{}", call, RestCallTrace()).body;
 			string unused_path;
 			HTTPUtil::DecomposeURL(spec_url, unused_path, spec_origin);
 		} else {
@@ -299,6 +382,7 @@ static unique_ptr<Catalog> RestAttach(StorageExtensionInfo *storage_info, Client
 		// independently per resource URL since a spec can span multiple hosts.
 		for (auto &resource : resources) {
 			resource.headers_json = ResolveHeaders(context, resource.url, resource.headers_json);
+			resource.call = call;
 		}
 
 		info.path = ":memory:";
@@ -324,7 +408,7 @@ static unique_ptr<Catalog> RestAttach(StorageExtensionInfo *storage_info, Client
 			// for the whole namespace - a namespace's resources can span different hosts (e.g.
 			// GCP's various services), and different hosts may match different stored secrets.
 			resources.push_back(
-			    {resource_name, resource_url, method, ResolveHeaders(context, resource_url, headers_json), paging});
+			    {resource_name, resource_url, method, ResolveHeaders(context, resource_url, headers_json), paging, call});
 		});
 		if (resources.empty()) {
 			throw BinderException("rest_ext ATTACH: resources={...} must be a non-empty JSON object mapping "
@@ -350,6 +434,7 @@ static unique_ptr<Catalog> RestAttach(StorageExtensionInfo *storage_info, Client
 	fetch_info->headers_json = ResolveHeaders(context, url, headers_json);
 	fetch_info->method = method;
 	fetch_info->paging = paging;
+	fetch_info->call = call;
 
 	// Build a TableFunction named after the ATTACH alias itself (e.g. "myapi"), so
 	// `SELECT * FROM myapi(...)` resolves to it directly - see rest_attachment_catalog.hpp's

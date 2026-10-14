@@ -1,0 +1,827 @@
+# name: test/sql/rest_ext_calls.test
+# description: retries, bounds, Link paging and the rest_ext_calls() diagnostics against a local fixture server
+# group: [rest_ext]
+
+# These tests need test/fixtures/fixture_server.py. test/run_fixture_tests.sh starts it and exports
+# REST_EXT_FIXTURE_URL (e.g. http://127.0.0.1:41234); without that variable the file is skipped.
+
+require rest_ext
+
+require-env REST_EXT_FIXTURE_URL
+
+# ---------------------------------------------------------------------------------------------
+# The shape of rest_ext_calls()
+# ---------------------------------------------------------------------------------------------
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM rest_ext_calls());
+----
+alias	VARCHAR
+endpoint	VARCHAR
+method	VARCHAR
+page_index	INTEGER
+started_at	TIMESTAMP
+latency_ms	BIGINT
+status	INTEGER
+outcome	VARCHAR
+bytes	BIGINT
+rows	BIGINT
+retries	INTEGER
+waited_ms	BIGINT
+retry_after_ms	BIGINT
+rate_limit	VARCHAR
+error	VARCHAR
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/_hits' AS hits_api (TYPE rest_ext);
+
+statement ok
+SELECT * FROM hits_api('{"path":"/nothing"}', '{}');
+
+# ---------------------------------------------------------------------------------------------
+# Without any new option a call behaves as before: one attempt, no retries, recorded as one row
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/ok' AS plain (TYPE rest_ext);
+
+query I
+SELECT count(*) FROM plain('{}', '{}');
+----
+2
+
+query TTTIIITIII
+SELECT alias, regexp_replace(endpoint, '^[^/]*', 'HOST'), method, page_index, status, rows, outcome, retries, waited_ms, bytes
+FROM rest_ext_calls();
+----
+plain	HOST/ok	GET	0	200	2	ok	0	0	22
+
+query T
+SELECT retry_after_ms IS NULL AND rate_limit IS NULL AND error IS NULL FROM rest_ext_calls();
+----
+true
+
+# the default User-Agent identifies the extension; the Content-Type of a body-less GET is untouched
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/echo' AS echo_default (TYPE rest_ext);
+
+query T
+SELECT user_agent FROM echo_default('{}', '{}');
+----
+rest_ext
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/echo' AS echo_ua (TYPE rest_ext, USER_AGENT 'my-agent/1.2');
+
+query T
+SELECT user_agent FROM echo_ua('{}', '{}');
+----
+my-agent/1.2
+
+# a header given in headers= wins over USER_AGENT
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/echo headers={"user-agent":"from-headers/9"}' AS echo_hdr (TYPE rest_ext, USER_AGENT 'my-agent/1.2');
+
+query T
+SELECT user_agent FROM echo_hdr('{}', '{}');
+----
+from-headers/9
+
+# ---------------------------------------------------------------------------------------------
+# A 429 with no retries fails the call and records what the server said
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/flaky/{id}' AS limited (TYPE rest_ext);
+
+statement error
+SELECT * FROM limited('{"id":"secret-id-1","fails":"1","retry_after":"1"}', '{}');
+----
+returned status 429
+
+query TTIITII
+SELECT alias, regexp_replace(endpoint, '^[^/]*', 'HOST'), status, retries, outcome, retry_after_ms, waited_ms
+FROM rest_ext_calls();
+----
+limited	HOST/flaky/{id}	429	0	rate_limited	1000	0
+
+# rate-limit headers are recorded; cookies are not
+query TTTT
+SELECT rate_limit LIKE '%"x-ratelimit-remaining":"0"%', rate_limit LIKE '%"x-ratelimit-limit":"100"%',
+       rate_limit LIKE '%"retry-after":"1"%', rate_limit ILIKE '%cookie%' OR rate_limit LIKE '%SECRET%'
+FROM rest_ext_calls();
+----
+true	true	true	false
+
+# ---------------------------------------------------------------------------------------------
+# Retries: Retry-After is honoured
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/flaky/{id}' AS retrying (TYPE rest_ext, RETRIES 3, RETRY_BACKOFF_MS 20, RETRY_CAP_MS 2000);
+
+query I
+SELECT id FROM retrying('{"id":"ra-seconds","fails":"2","retry_after":"1"}', '{}');
+----
+3
+
+query IIIIT
+SELECT retries, waited_ms, retry_after_ms, status, outcome FROM rest_ext_calls();
+----
+2	2000	1000	200	ok
+
+# the server was asked exactly 3 times
+query I
+SELECT hits FROM hits_api('{"path":"/flaky/ra-seconds"}', '{}');
+----
+3
+
+# a Retry-After beyond the cap is waited out only up to the cap
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/flaky/{id}' AS capped (TYPE rest_ext, RETRIES 1, RETRY_BACKOFF_MS 20, RETRY_CAP_MS 300);
+
+statement ok
+SELECT * FROM capped('{"id":"ra-capped","fails":"1","retry_after":"60"}', '{}');
+
+query IIII
+SELECT retries, waited_ms, retry_after_ms, status FROM rest_ext_calls();
+----
+1	300	60000	200
+
+# an HTTP-date Retry-After is converted to a wait
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/flaky/{id}' AS dated (TYPE rest_ext, RETRIES 1, RETRY_BACKOFF_MS 20, RETRY_CAP_MS 5000);
+
+statement ok
+SELECT * FROM dated('{"id":"ra-date","fails":"1","retry_after":"date"}', '{}');
+
+query TT
+SELECT retry_after_ms BETWEEN 500 AND 2100, waited_ms = retry_after_ms FROM rest_ext_calls();
+----
+true	true
+
+# ---------------------------------------------------------------------------------------------
+# Retries: jittered exponential backoff when the server gives no Retry-After
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/flaky/{id}' AS backoff (TYPE rest_ext, RETRIES 3, RETRY_BACKOFF_MS 40, RETRY_CAP_MS 100);
+
+statement ok
+SELECT * FROM backoff('{"id":"bo","fails":"3","status":"503"}', '{}');
+
+# waits are in [20,40] + [40,80] + [50,100]
+query TT
+SELECT retries, waited_ms BETWEEN 110 AND 220 FROM rest_ext_calls();
+----
+3	true
+
+# 502 and 504 are retried too
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+SELECT * FROM backoff('{"id":"bad-gateway","fails":"1","status":"502"}', '{}');
+
+statement ok
+SELECT * FROM backoff('{"id":"gw-timeout","fails":"1","status":"504"}', '{}');
+
+query II
+SELECT retries, status FROM rest_ext_calls();
+----
+1	200
+1	200
+
+# retries run out: the last response is the error, the call counts every retry
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement error
+SELECT * FROM backoff('{"id":"exhausted","fails":"10","status":"503"}', '{}');
+----
+returned status 503 (after 3 retries)
+
+query IITI
+SELECT retries, status, outcome, rows FROM rest_ext_calls();
+----
+3	503	http_error	NULL
+
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement error
+SELECT * FROM backoff('{"id":"exhausted-429","fails":"10","status":"429"}', '{}');
+----
+returned status 429
+
+query IT
+SELECT retries, outcome FROM rest_ext_calls();
+----
+3	rate_limited
+
+# ---------------------------------------------------------------------------------------------
+# Other client and server errors are never retried
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/status/{code}/x' AS fixed (TYPE rest_ext, RETRIES 5, RETRY_BACKOFF_MS 10, RETRY_CAP_MS 20);
+
+statement error
+SELECT * FROM fixed('{"code":"404"}', '{}');
+----
+returned status 404
+
+statement error
+SELECT * FROM fixed('{"code":"400"}', '{}');
+----
+returned status 400
+
+statement error
+SELECT * FROM fixed('{"code":"500"}', '{}');
+----
+returned status 500
+
+query ITII
+SELECT status, outcome, retries, waited_ms FROM rest_ext_calls() ORDER BY status;
+----
+400	http_error	0	0
+404	http_error	0	0
+500	http_error	0	0
+
+query I
+SELECT hits FROM hits_api('{"path":"/status/404/x"}', '{}');
+----
+1
+
+# ---------------------------------------------------------------------------------------------
+# Network failures: a dropped connection is retried, and recorded with a NULL status
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/dropped/{id}' AS dropped (TYPE rest_ext);
+
+statement error
+SELECT * FROM dropped('{"id":"no-retry","fails":"1"}', '{}');
+----
+HTTP request to
+
+query TIT
+SELECT outcome, status, error IS NOT NULL FROM rest_ext_calls();
+----
+network	NULL	true
+
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/dropped/{id}' AS dropped_retry (TYPE rest_ext, RETRIES 3, RETRY_BACKOFF_MS 10, RETRY_CAP_MS 50);
+
+query I
+SELECT id FROM dropped_retry('{"id":"with-retry","fails":"2"}', '{}');
+----
+3
+
+query ITI
+SELECT retries, outcome, status FROM rest_ext_calls();
+----
+2	ok	200
+
+# ---------------------------------------------------------------------------------------------
+# TIMEOUT_MS: a stalled response is a timeout, and a retry can recover
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/slow/{id}' AS slow (TYPE rest_ext, TIMEOUT_MS 300);
+
+statement error
+SELECT * FROM slow('{"id":"always-slow","ms":"1500"}', '{}');
+----
+HTTP request to
+
+query TITT
+SELECT outcome, status, latency_ms BETWEEN 250 AND 1200, error IS NOT NULL FROM rest_ext_calls();
+----
+timeout	NULL	true	true
+
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/slow/{id}' AS slow_retry (TYPE rest_ext, TIMEOUT_MS 300, RETRIES 1, RETRY_BACKOFF_MS 10, RETRY_CAP_MS 20);
+
+query I
+SELECT id FROM slow_retry('{"id":"once-slow","fails":"1","ms":"1500"}', '{}');
+----
+2
+
+query IT
+SELECT retries, outcome FROM rest_ext_calls();
+----
+1	ok
+
+# a body that stalls half way is a timeout too
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/slowbody' AS slowbody (TYPE rest_ext, TIMEOUT_MS 500);
+
+statement error
+SELECT * FROM slowbody('{}', '{}');
+----
+HTTP request to
+
+query TI
+SELECT outcome, status FROM rest_ext_calls();
+----
+timeout	NULL
+
+# ---------------------------------------------------------------------------------------------
+# MAX_BYTES
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/big' AS big_limited (TYPE rest_ext, MAX_BYTES 10000);
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/bigchunked' AS chunked_limited (TYPE rest_ext, MAX_BYTES 10000);
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/big' AS big_roomy (TYPE rest_ext, MAX_BYTES 1000000);
+
+statement error
+SELECT count(*) FROM big_limited('{"n":"1000"}', '{}');
+----
+larger than MAX_BYTES
+
+statement error
+SELECT count(*) FROM chunked_limited('{"n":"1000"}', '{}');
+----
+larger than MAX_BYTES
+
+query I
+SELECT count(*) FROM big_roomy('{"n":"1000"}', '{}');
+----
+1000
+
+query TITI
+SELECT outcome, status, bytes > 10000, retries FROM rest_ext_calls();
+----
+bound_hit	200	0	0
+bound_hit	200	1	0
+ok	200	1	0
+
+# ---------------------------------------------------------------------------------------------
+# MAX_ROWS stops paging without an error, and says so on the last call
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/pages/{id}' AS capped_rows (TYPE rest_ext, ITEMS '/data', NEXT_URL '/next', MAX_ROWS 7);
+
+query II
+SELECT count(*), max(id) FROM capped_rows('{"id":"mr1"}', '{}');
+----
+7	7
+
+query IIT
+SELECT page_index, rows, outcome FROM rest_ext_calls() ORDER BY page_index;
+----
+0	3	ok
+1	3	ok
+2	3	bound_hit
+
+# the cap equal to the data is not a bound
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/pages/{id}' AS exact_rows (TYPE rest_ext, ITEMS '/data', NEXT_URL '/next', MAX_ROWS 15);
+
+query I
+SELECT count(*) FROM exact_rows('{"id":"mr2"}', '{}');
+----
+15
+
+query II
+SELECT count(*), count(*) FILTER (outcome = 'bound_hit') FROM rest_ext_calls();
+----
+5	0
+
+# MAX_ROWS on an unpaged response
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/big' AS capped_big (TYPE rest_ext, MAX_ROWS 10);
+
+query I
+SELECT count(*) FROM capped_big('{"n":"100"}', '{}');
+----
+10
+
+query IT
+SELECT rows, outcome FROM rest_ext_calls();
+----
+100	bound_hit
+
+# MAX_PAGES keeps raising, and is marked on the call it stopped after
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/pages/{id}' AS capped_pages (TYPE rest_ext, ITEMS '/data', NEXT_URL '/next', MAX_PAGES 2);
+
+statement error
+SELECT count(*) FROM capped_pages('{"id":"mp"}', '{}');
+----
+stopped after MAX_PAGES (2) pages
+
+query IT
+SELECT page_index, outcome FROM rest_ext_calls() ORDER BY page_index;
+----
+0	ok
+1	bound_hit
+
+# ---------------------------------------------------------------------------------------------
+# NEXT_LINK_HEADER
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/pages/{id}' AS linked (TYPE rest_ext, ITEMS '/data', NEXT_LINK_HEADER true);
+
+query II
+SELECT count(*), max(id) FROM linked('{"id":"lk1"}', '{}');
+----
+15	15
+
+query IIT
+SELECT page_index, rows, regexp_replace(endpoint, '^[^/]*', 'HOST') FROM rest_ext_calls() ORDER BY page_index;
+----
+0	3	HOST/pages/{id}
+1	3	HOST/pages/{id}
+2	3	HOST/pages/{id}
+3	3	HOST/pages/{id}
+4	3	HOST/pages/{id}
+
+# relative targets, with an unquoted rel
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/linkrel' AS linkrel (TYPE rest_ext, NEXT_LINK_HEADER 1);
+
+query I
+SELECT list(id ORDER BY id) = [1, 2, 3] FROM linkrel('{}', '{}');
+----
+true
+
+# a Link to another origin is not followed
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+SELECT * FROM hits_api('{"path":"/offorigin"}', '{}');
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/linkoff' AS linkoff (TYPE rest_ext, NEXT_LINK_HEADER true);
+
+statement error
+SELECT count(*) FROM linkoff('{}', '{}');
+----
+not on the endpoint's origin
+
+query I
+SELECT count(*) FROM rest_ext_calls() WHERE endpoint LIKE '%localhost%';
+----
+0
+
+# a Link that points at itself is a loop
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/linkloop' AS linkloop (TYPE rest_ext, NEXT_LINK_HEADER true);
+
+statement error
+SELECT count(*) FROM linkloop('{}', '{}');
+----
+same next-page cursor twice
+
+# a cursor that never advances is a loop too
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/cursorloop' AS cursorloop (TYPE rest_ext, ITEMS '/data', NEXT_TOKEN '/cursor', TOKEN_PARAM 'c');
+
+statement error
+SELECT count(*) FROM cursorloop('{}', '{}');
+----
+same next-page cursor twice
+
+statement error
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/ok' AS two_styles (TYPE rest_ext, NEXT_LINK_HEADER true, NEXT_URL '/next');
+----
+NEXT_LINK_HEADER is one of these paging styles
+
+# ---------------------------------------------------------------------------------------------
+# A redirect to another origin is refused, and the other origin is never contacted
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/redir-off headers={"X-Api-Key":"must-not-leak"}' AS redirect (TYPE rest_ext, RETRIES 2, RETRY_BACKOFF_MS 10, RETRY_CAP_MS 20);
+
+statement error
+SELECT * FROM redirect('{}', '{}');
+----
+redirected to another origin
+
+query ITIT
+SELECT status, outcome, retries, error FROM rest_ext_calls();
+----
+302	http_error	0	redirected to another origin; not followed
+
+query I
+SELECT hits FROM hits_api('{"path":"/offorigin"}', '{}');
+----
+0
+
+# ---------------------------------------------------------------------------------------------
+# RATE_LIMIT_HEADERS
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/ratelimit' AS rl_default (TYPE rest_ext);
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/ratelimit' AS rl_custom (TYPE rest_ext, RATE_LIMIT_HEADERS '["x-custom-quota", "X-RateLimit-Remaining"]');
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/ratelimit' AS rl_prefix (TYPE rest_ext, RATE_LIMIT_HEADERS '["x-ratelimit-*"]');
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/ratelimit' AS rl_none (TYPE rest_ext, RATE_LIMIT_HEADERS '[]');
+
+statement ok
+SELECT * FROM rl_default('{}', '{}');
+
+statement ok
+SELECT * FROM rl_custom('{}', '{}');
+
+statement ok
+SELECT * FROM rl_prefix('{}', '{}');
+
+statement ok
+SELECT * FROM rl_none('{}', '{}');
+
+# default: Retry-After, X-RateLimit-*, RateLimit-*, x-ms-ratelimit-remaining-*; not other headers
+query TTTTTTT
+SELECT rate_limit LIKE '%"x-ratelimit-remaining":"7"%', rate_limit LIKE '%"x-ratelimit-limit":"100"%',
+       rate_limit LIKE '%"ratelimit-reset":"30"%', rate_limit LIKE '%"x-ms-ratelimit-remaining-subscription-reads":"11999"%',
+       rate_limit LIKE '%x-custom-quota%', rate_limit ILIKE '%cookie%', length(rate_limit) > 0
+FROM rest_ext_calls() WHERE alias = 'rl_default';
+----
+true	true	true	true	false	false	true
+
+query TTTT
+SELECT rate_limit LIKE '%"x-custom-quota":"5"%', rate_limit LIKE '%"x-ratelimit-remaining":"7"%',
+       rate_limit LIKE '%x-ratelimit-limit%', rate_limit LIKE '%ratelimit-reset%'
+FROM rest_ext_calls() WHERE alias = 'rl_custom';
+----
+true	true	false	false
+
+query TTT
+SELECT rate_limit LIKE '%x-ratelimit-remaining%', rate_limit LIKE '%x-ratelimit-limit%', rate_limit LIKE '%ratelimit-reset%'
+FROM rest_ext_calls() WHERE alias = 'rl_prefix';
+----
+true	true	false
+
+query T
+SELECT rate_limit IS NULL FROM rest_ext_calls() WHERE alias = 'rl_none';
+----
+true
+
+# ---------------------------------------------------------------------------------------------
+# Nothing secret is recorded
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/reflect?token=urltoken777 headers={"X-Api-Key":"super-secret-key-123"}' AS leaky (TYPE rest_ext, RATE_LIMIT_HEADERS '["x-ratelimit-remaining"]');
+
+statement error
+SELECT * FROM leaky('{"api_key":"querysecret999"}', '{}');
+----
+returned status 400
+
+# the endpoint is host + path template: no query string, no credentials
+query T
+SELECT endpoint LIKE '%?%' OR endpoint LIKE '%querysecret%' OR endpoint LIKE '%urltoken%' FROM rest_ext_calls();
+----
+false
+
+# the error excerpt masks the values the request carried, even when the API echoes them back
+query TTTT
+SELECT error LIKE 'HTTP 400: %', error LIKE '%super-secret-key-123%', error LIKE '%querysecret999%' OR error LIKE '%urltoken777%',
+       error LIKE '%key=***%'
+FROM rest_ext_calls();
+----
+true	false	false	true
+
+query T
+SELECT count(*) FROM rest_ext_calls()
+WHERE concat_ws('|', alias, endpoint, method, outcome, rate_limit, error) LIKE '%super-secret-key-123%';
+----
+0
+
+# ---------------------------------------------------------------------------------------------
+# Other attach modes carry the options too
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'resources={"Flaky":"${REST_EXT_FIXTURE_URL}/flaky/{id}","Ok":"${REST_EXT_FIXTURE_URL}/ok"}' AS ns (TYPE rest_ext, RETRIES 2, RETRY_BACKOFF_MS 10, RETRY_CAP_MS 30);
+
+query I
+SELECT id FROM ns.Flaky('{"id":"ns1","fails":"1","status":"503"}', '{}');
+----
+2
+
+query TI
+SELECT alias, retries FROM rest_ext_calls();
+----
+ns	1
+
+# a non-JSON response on a paged endpoint is an invalid body; unpaged it is a raw text row
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/html' AS html_paged (TYPE rest_ext, ITEMS '/rows');
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/html' AS html_plain (TYPE rest_ext);
+
+statement error
+SELECT * FROM html_paged('{}', '{}');
+----
+not JSON
+
+query I
+SELECT result FROM html_plain('{}', '{}') WHERE result LIKE '%not json%' AND true;
+----
+<html>not json</html>
+
+query TTI
+SELECT alias, outcome, rows FROM rest_ext_calls() ORDER BY alias;
+----
+html_paged	invalid_body	NULL
+html_plain	ok	1
+
+# a POST is retried with its body
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+statement ok
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/flaky/{id} method=POST' AS posting (TYPE rest_ext, RETRIES 1, RETRY_BACKOFF_MS 10, RETRY_CAP_MS 20);
+
+query I
+SELECT echo FROM posting('{"id":"p1"}', '{"q":1}');
+----
+{"q":1}
+
+query TII
+SELECT method, retries, status FROM rest_ext_calls();
+----
+POST	1	200
+
+# ---------------------------------------------------------------------------------------------
+# The ring holds the last 500 calls, rest_ext_calls_clear() empties it, concurrent callers are safe
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM rest_ext_calls_clear();
+
+loop i 0 520
+
+statement ok
+SELECT * FROM plain('{"n":"${i}"}', '{}');
+
+endloop
+
+query I
+SELECT count(*) FROM rest_ext_calls();
+----
+500
+
+query I
+SELECT count(*) FROM (SELECT started_at >= lag(started_at) OVER (ORDER BY rowid) AS ordered FROM (SELECT row_number() OVER () AS rowid, started_at FROM rest_ext_calls())) WHERE ordered = false;
+----
+0
+
+query I
+SELECT cleared FROM rest_ext_calls_clear();
+----
+500
+
+query I
+SELECT count(*) FROM rest_ext_calls();
+----
+0
+
+concurrentloop threadid 0 8
+
+loop i 0 10
+
+statement ok
+SELECT * FROM plain('{"n":"${threadid}-${i}"}', '{}');
+
+endloop
+
+endloop
+
+query I
+SELECT count(*) FROM rest_ext_calls();
+----
+80
+
+# ---------------------------------------------------------------------------------------------
+# Option validation
+# ---------------------------------------------------------------------------------------------
+
+statement error
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/ok' AS bad1 (TYPE rest_ext, RETRIES -1);
+----
+RETRIES must be an integer
+
+statement error
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/ok' AS bad2 (TYPE rest_ext, RETRIES 21);
+----
+RETRIES must be an integer
+
+statement error
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/ok' AS bad3 (TYPE rest_ext, RETRY_BACKOFF_MS 1000, RETRY_CAP_MS 10);
+----
+RETRY_CAP_MS (10) must be at least RETRY_BACKOFF_MS (1000)
+
+statement error
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/ok' AS bad4 (TYPE rest_ext, MAX_ROWS 0);
+----
+MAX_ROWS must be an integer
+
+statement error
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/ok' AS bad5 (TYPE rest_ext, TIMEOUT_MS abc);
+----
+TIMEOUT_MS must be an integer
+
+statement error
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/ok' AS bad6 (TYPE rest_ext, RATE_LIMIT_HEADERS 'x-ratelimit-remaining');
+----
+RATE_LIMIT_HEADERS must be a JSON array
+
+statement error
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/ok' AS bad7 (TYPE rest_ext, NEXT_LINK_HEADER maybe);
+----
+NEXT_LINK_HEADER must be true or false
+
+statement error
+ATTACH 'url=${REST_EXT_FIXTURE_URL}/ok' AS bad8 (TYPE rest_ext, MAX_BYTES 0);
+----
+MAX_BYTES must be an integer

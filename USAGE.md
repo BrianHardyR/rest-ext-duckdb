@@ -471,8 +471,10 @@ RFC 6901 JSON pointer into one page's response:
 | `COLUMNS '/columns'` | for a tabular response (`{"columns": [...], "rows": [[...], ...]}`): name each row array's values after this column list, whose entries are names or objects with a `"name"` |
 | `COLUMN_TYPES '{"Cost":"DOUBLE"}'` | declare a column's type (`VARCHAR`, `BIGINT`, `DOUBLE`, `BOOLEAN`, or a `LIST` or `STRUCT` of those) instead of inferring it; declared columns are present even when there are no rows |
 
-These options also work on an endpoint that doesn't paginate. Set one of `NEXT_URL`, `NEXT_TOKEN`,
-`PAGE_PARAM` and `OFFSET_PARAM`: they are four ways of asking for the next page.
+These options also work on an endpoint that doesn't paginate. Set one of `NEXT_URL`,
+`NEXT_LINK_HEADER`, `NEXT_TOKEN`, `PAGE_PARAM` and `OFFSET_PARAM`: they are five ways of asking for the
+next page. `NEXT_LINK_HEADER` and `MAX_ROWS` are described under
+[Retries, bounds and call diagnostics](#retries-bounds-and-call-diagnostics).
 
 Paging stops when the cursor is missing, null or empty, or - for `PAGE_PARAM` and `OFFSET_PARAM`,
 which have no cursor to read - when a page is empty or shorter than `PAGE_SIZE`. The page size
@@ -508,8 +510,8 @@ ATTACH 'url=https://api.datadoghq.com/api/v2/users method=GET headers={...}'
 SELECT id, attributes.email FROM users('{"page[size]":"100"}', '{}');
 ```
 
-A `NEXT_URL` is only followed on the endpoint's own origin (scheme, host and port), so a response
-can't redirect the request's headers - its credentials - to another host.
+A `NEXT_URL` (or `NEXT_LINK_HEADER` target) is only followed on the endpoint's own origin (scheme, host
+and port), so a response can't redirect the request's headers - its credentials - to another host.
 
 ## Authentication
 
@@ -567,14 +569,123 @@ FROM secretapi('{}', '{}');
 └─────────────┴──────────────┘
 ```
 
+## Retries, bounds and call diagnostics
+
+Every option here is optional and per `ATTACH`; with none of them a call is one attempt with the
+default timeouts, exactly as before (the one visible difference is the `User-Agent`, below). They work
+in single-endpoint, namespace and `FORMAT 'openapi'` mode alike (for the last, they apply to the spec
+fetch and every operation).
+
+| Option | Meaning |
+|---|---|
+| `RETRIES 3` | extra attempts after a retryable failure (default 0, at most 20) |
+| `RETRY_BACKOFF_MS 500` | base of the wait between attempts (default 500): the n-th wait is uniform in `[d/2, d]` with `d = min(cap, base * 2^n)` |
+| `RETRY_CAP_MS 30000` | the longest single wait, `Retry-After` included (default 30000; not below `RETRY_BACKOFF_MS`) |
+| `TIMEOUT_MS 5000` | connect, read and write timeout per attempt (default: 10s connect, 30s read/write) |
+| `MAX_BYTES 1000000` | refuse a response body larger than this; reading stops as soon as it is exceeded |
+| `MAX_ROWS 5000` | stop returning rows after this many, without an error; paging stops with it |
+| `NEXT_LINK_HEADER true` | the next page is the target of the `Link` response header's `rel="next"` (absolute or relative); same origin only, like `NEXT_URL`; `ITEMS` is optional |
+| `RATE_LIMIT_HEADERS '["x-ratelimit-remaining","ratelimit-*"]'` | which response headers to record in `rest_ext_calls()` (case-insensitive; a trailing `*` is a prefix). Default: `Retry-After`, `X-RateLimit-*`, `RateLimit-*`, `x-ms-ratelimit-remaining-*`. `'[]'` records none |
+| `USER_AGENT 'my-app/1.0'` | the `User-Agent` request header (default `rest_ext`); a `User-Agent` in `headers=` or a secret wins |
+
+**What is retried.** Status 429, 502, 503 and 504, and a connection that fails, resets or times out.
+Never any other status (404 and 500 fail on the first response). A `Retry-After` header (seconds or an
+HTTP date) sets the wait, cut to `RETRY_CAP_MS`; without one the jittered exponential backoff applies.
+The retry is of the whole request, body included, so a `POST` that is not safe to repeat should not
+set `RETRIES`. A body that dies half way is a failed attempt and is retried too.
+
+```sql
+ATTACH 'url=https://api.example.com/v1/things/{id}' AS api
+    (TYPE rest_ext, RETRIES 3, RETRY_BACKOFF_MS 100, RETRY_CAP_MS 5000);
+SELECT * FROM api('{"id":"orders"}', '{}');   -- the server answers 429 Retry-After: 1 twice, then 200
+```
+
+```text
+┌───────┬────────────────────────────┬────────┬─────────┬─────────┬───────────┬────────────────┬────────────────────────────────┐
+│ alias │          endpoint          │ status │ outcome │ retries │ waited_ms │ retry_after_ms │           rate_limit           │
+├───────┼────────────────────────────┼────────┼─────────┼─────────┼───────────┼────────────────┼────────────────────────────────┤
+│ api   │ 127.0.0.1:45909/flaky/{id} │ 200    │ ok      │ 2       │ 2000      │ 1000           │ {"x-ratelimit-remaining":"99"} │
+└───────┴────────────────────────────┴────────┴─────────┴─────────┴───────────┴────────────────┴────────────────────────────────┘
+```
+(`SELECT alias, endpoint, status, outcome, retries, waited_ms, retry_after_ms, rate_limit FROM rest_ext_calls()`.)
+
+### `rest_ext_calls()`
+
+A table function over the last 500 HTTP calls made by this DuckDB instance (oldest first, any
+`ATTACH`, thread-safe, in memory only). One row is one call, retries and same-origin redirects
+included; a paged read is one row per page. `rest_ext_calls_clear()` empties it and returns
+`cleared BIGINT`, the number of rows removed.
+
+| Column | Type | |
+|---|---|---|
+| `alias` | VARCHAR | the `ATTACH` name |
+| `endpoint` | VARCHAR | host (and port) plus the path *template*: `127.0.0.1:45909/flaky/{id}`. No scheme, credentials, query string or path-parameter values |
+| `method` | VARCHAR | `GET`, `POST`, ... |
+| `page_index` | INTEGER | 0 for the first request of a scan, then 1, 2, ... |
+| `started_at` | TIMESTAMP | UTC, when the call began |
+| `latency_ms` | BIGINT | the whole call: every attempt plus every wait |
+| `status` | INTEGER | the final HTTP status; NULL if there was no response |
+| `outcome` | VARCHAR | `ok`, `http_error`, `network`, `timeout`, `rate_limited` (429, or 503 with `Retry-After`), `bound_hit`, `invalid_body` |
+| `bytes` | BIGINT | response body bytes read |
+| `rows` | BIGINT | rows in the response; NULL if it failed |
+| `retries` | INTEGER | extra attempts made |
+| `waited_ms` | BIGINT | time slept between attempts |
+| `retry_after_ms` | BIGINT | the `Retry-After` the server last sent, as a wait; NULL if none (it can exceed `waited_ms`: the wait is cut to `RETRY_CAP_MS`) |
+| `rate_limit` | VARCHAR | JSON object of the recorded response headers (names lower-cased), from the final response; NULL if none |
+| `error` | VARCHAR | what went wrong, short; NULL for `ok` |
+
+`bound_hit` marks a call that was stopped by `MAX_BYTES` (an error, the body is too big to use), or the
+last call of a scan that stopped at `MAX_ROWS` or `MAX_PAGES` while the API may have had more. Only the
+endpoint template, the status and the headers asked for are recorded: never a header, credential or
+query value that was sent. The `error` text for a non-2xx response carries the first 200 characters of
+the body with any header or query value of the request masked as `***`. A secret placed in the URL
+*path* of the template itself would be visible, so keep credentials in headers or query parameters.
+
+```sql
+ATTACH 'url=https://api.example.com/v1/hosts' AS hosts
+    (TYPE rest_ext, ITEMS '/data', NEXT_LINK_HEADER true, MAX_ROWS 7);
+SELECT count(*) FROM hosts('{}', '{}');                                   -- 7, with no error
+SELECT page_index, rows, outcome, error FROM rest_ext_calls() ORDER BY page_index;
+```
+
+```text
+┌────────────┬──────┬───────────┬─────────────────────────┐
+│ page_index │ rows │  outcome  │          error          │
+├────────────┼──────┼───────────┼─────────────────────────┤
+│ 0          │ 3    │ ok        │ NULL                    │
+│ 1          │ 3    │ ok        │ NULL                    │
+│ 2          │ 3    │ bound_hit │ stopped at MAX_ROWS (7) │
+└────────────┴──────┴───────────┴─────────────────────────┘
+```
+
+```sql
+ATTACH 'url=https://api.example.com/v1/slow/{id}' AS slowapi (TYPE rest_ext, TIMEOUT_MS 300);
+SELECT * FROM slowapi('{"id":"s"}', '{}');     -- IO Error: ... failed: Failed to read connection
+SELECT outcome, status, error FROM rest_ext_calls();   -- timeout | NULL | timed out: Failed to read connection
+
+ATTACH 'url=https://api.example.com/v1/big' AS bigapi (TYPE rest_ext, MAX_BYTES 10000);
+SELECT count(*) FROM bigapi('{}', '{}');       -- IO Error: ... larger than MAX_BYTES (10000); not reading it
+SELECT outcome, status, error FROM rest_ext_calls();   -- bound_hit | 200 | response is larger than MAX_BYTES (10000)
+
+ATTACH 'url=https://api.example.com/v1/quota' AS rl
+    (TYPE rest_ext, RATE_LIMIT_HEADERS '["x-ratelimit-remaining","x-custom-quota"]', USER_AGENT 'dashboard/2.0');
+SELECT rate_limit FROM rest_ext_calls();       -- {"x-ratelimit-remaining":"7","x-custom-quota":"5"}
+```
+
+`timeout` is a connect timeout, or a read or write that ran out its `TIMEOUT_MS` (a stalled body counts);
+httplib reports the latter as a read error, so a read that fails after most of the timeout is classed as
+a timeout. The timeout applies to each read, so a body that trickles in slowly is not cut off as a whole.
+The default `User-Agent` is `rest_ext`; before it was httplib's own.
+
 ## HTTP semantics
 
 | | |
 |---|---|
 | Methods | `GET`, `POST`, `PUT`, `PATCH`, `DELETE` (case-insensitive); anything else is a clear error |
-| Connect timeout | 10s |
-| Read timeout | 30s |
-| Write timeout | 30s |
+| Connect timeout | 10s (`TIMEOUT_MS` overrides) |
+| Read timeout | 30s (`TIMEOUT_MS` overrides) |
+| Write timeout | 30s (`TIMEOUT_MS` overrides) |
+| Retries | none unless `RETRIES` is set; see [Retries, bounds and call diagnostics](#retries-bounds-and-call-diagnostics) |
 | Redirects | followed on the same origin only (up to 5); a redirect to another origin is an error, so headers are never forwarded to another host |
 | Headers | a name must be an HTTP token and a value may not contain a control character (CR/LF would inject headers) |
 | Path `{placeholders}` | values are percent-encoded (`/` kept); a `..` segment is refused; a placeholder in the host may only hold letters, digits, `-` and `.` |
@@ -608,10 +719,11 @@ ATTACH 'url=https://elsewhere.example' AS x (TYPE rest_ext);  -- Permission Erro
 
 - OpenAPI (2.0/3.x) is the only supported spec format - convert other formats (e.g. Postman) to
   OpenAPI first.
-- Pagination (see [Pagination](#pagination)) follows a cursor or next-page link in the JSON body;
-  a `Link` response header isn't read. The pagination options don't apply to `FORMAT 'openapi'`.
-- A single request can block for up to the read timeout (30s); an interrupt takes effect between
-  pages, not inside one request.
+- Pagination (see [Pagination](#pagination)) follows a cursor or next-page link in the JSON body, or
+  a `Link` header with `NEXT_LINK_HEADER`. The pagination options don't apply to `FORMAT 'openapi'`.
+- A single request can block for up to the read timeout (30s, or `TIMEOUT_MS`); an interrupt takes
+  effect between pages and during a retry wait, not inside one request.
+- `rest_ext_calls()` is per DuckDB instance and in memory: it is empty after a restart and holds 500 calls.
 - OpenAPI security schemes aren't parsed - configure auth via `CREATE SECRET`/`headers=` instead.
 - Namespace mode's hand-written `resources={...}` gives every resource the same HTTP method; use
   OpenAPI import if you need a mix of GET/POST/etc. under one alias.
